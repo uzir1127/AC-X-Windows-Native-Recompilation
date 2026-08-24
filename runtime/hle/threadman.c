@@ -1,13 +1,3 @@
-/* runtime/hle/threadman.c -- ThreadManForUser: threads, semaphores, event
- * flags, callbacks, and the scheduler.
- *
- * Strict priority 1..127 (LOWER number = HIGHER priority), round-robin within
- * a priority, cooperative: a thread runs until it blocks, yields, or a
- * higher-priority thread becomes ready. Guest threads are FIBERS on one host
- * thread -- host threads would destroy determinism. Callbacks fire only
- * inside the ...CB wait variants. The clock is an emulated microsecond
- * counter, never host wall time, so traces are reproducible. */
-
 #include "hle.h"
 #include "sce_errors.h"
 #include "threadman.h"
@@ -23,7 +13,6 @@
 #  include <ucontext.h>
 #endif
 
-/* SceKernelThreadInfo.status values */
 #define TH_RUNNING  0x00000001
 #define TH_READY    0x00000002
 #define TH_WAITING  0x00000004
@@ -31,11 +20,12 @@
 #define TH_STOPPED  0x00000010
 #define TH_KILLED   0x00000020
 
-/* Kernel hand-off geometry, measured from hardware traces; no public header
- * describes it. */
-#define THREAD_ENTRY_FRAME     0x40u        /* sp .. argument block */
-#define KERNEL_CALLBACK_FRAME  0x80u        /* dispatcher's own frame */
-#define KERNEL_CALLBACK_RETURN 0x08000018u  /* $ra it installs */
+#define TRACE_CONTEXT_BOOT      (-1)
+#define TRACE_CONTEXT_INTERRUPT (-2)
+
+#define THREAD_ENTRY_FRAME     0x40u
+#define KERNEL_CALLBACK_FRAME  0x80u
+#define KERNEL_CALLBACK_RETURN 0x08000018u
 
 typedef enum {
     WAIT_NONE = 0, WAIT_SLEEP, WAIT_DELAY, WAIT_SEMA, WAIT_EVENTFLAG,
@@ -51,17 +41,16 @@ typedef struct Thread {
     int      priority;
     u32      attr;
     u32      stack_size;
-    u32      stack_base;      /* guest address of the lowest stack byte */
-    u32      tcb;             /* per-thread block the guest reaches via $k0 */
+    u32      stack_base;
+    u32      tcb;
     int      status;
     CpuCtx   ctx;
 
-    /* scheduling */
     WaitKind wait;
-    int      wait_cb;         /* the ...CB variant was used */
-    u64      wake_us;         /* for WAIT_DELAY */
-    u64      wait_vblank;     /* for WAIT_VBLANK: the count when we blocked */
-    int      wakeup_count;    /* sceKernelWakeupThread accumulates */
+    int      wait_cb;
+    u64      wake_us;
+    u64      wait_vblank;
+    int      wakeup_count;
     int      sema_uid, sema_need;
     int      evf_uid, evf_mode;
     u32      evf_bits, evf_resultpat;
@@ -69,10 +58,9 @@ typedef struct Thread {
     int      exit_status;
     u32      wait_timeout_ptr;
     int      timed_out;
-    int      order;           /* round-robin tiebreak within a priority */
-    int      zombie;          /* deleted itself; the scheduler reaps the slot */
+    int      order;
+    int      zombie;
 
-    /* startup */
     u32      arg_size, arg_block;
     int      started;
 
@@ -101,23 +89,17 @@ static Callback  g_cbs[MAX_CB];
 
 static int  g_next_uid = 0x100;
 static int  g_order;
-static int  g_current = -1;        /* index into g_threads */
-static u64  g_clock_us;            /* emulated microseconds since boot */
+static int  g_current = -1;
+static u64  g_clock_us;
 static u8  *g_ram;
 static int  g_intr_disable_depth;
 static int  g_exit_requested;
 
-/* vertical blank */
-/* The scheduler owns vblank: it fires exactly once per frame boundary the
- * emulated clock crosses, regardless of which thread (or none) is running --
- * otherwise the frame rate depends on scheduling. */
 static u64    g_vblank_count;
 static u64    g_next_vblank_us;
-/* PSPRECO_MAX_FRAMES: stop after this many emulated frames (0 = forever).
- * Frame limits are reproducible; wall-clock limits are not. */
 static u64    g_max_frames;
-static CpuCtx g_intr_ctx;          /* the context interrupt handlers run on */
-static int    g_in_vblank;         /* re-entrancy guard */
+static CpuCtx g_intr_ctx;
+static int    g_in_vblank;
 
 #if defined(_WIN32)
 static void *g_sched_fiber;
@@ -125,7 +107,6 @@ static void *g_sched_fiber;
 static ucontext_t g_sched_uctx;
 #endif
 
-/* clock */
 u64 threadman_now_us(void)          { return g_clock_us; }
 void threadman_advance_us(u64 usec) { g_clock_us += usec; }
 int  threadman_current_uid(void)
@@ -133,13 +114,11 @@ int  threadman_current_uid(void)
     return (g_current >= 0) ? g_threads[g_current].uid : 0;
 }
 
-/* Execution-context id for the differential trace. Non-thread contexts need
- * distinct negative ids: the comparator splits the stream by stack range. */
 int threadman_trace_context(void)
 {
-    if (g_in_vblank) return -2;                 /* interrupt context */
+    if (g_in_vblank) return TRACE_CONTEXT_INTERRUPT;
     if (g_current >= 0) return g_threads[g_current].uid;
-    return -1;                                  /* boot / module_start */
+    return TRACE_CONTEXT_BOOT;
 }
 void threadman_suspend_intr(void)   { g_intr_disable_depth++; }
 void threadman_resume_intr(void)
@@ -148,11 +127,12 @@ void threadman_resume_intr(void)
 }
 void threadman_request_exit(void)   { g_exit_requested = 1; }
 
-/* lookup */
+#define TH_SELF 0
+
 static Thread *thread_by_uid(int uid)
 {
     int i;
-    if (uid == 0 && g_current >= 0) return &g_threads[g_current];  /* TH_SELF */
+    if (uid == TH_SELF && g_current >= 0) return &g_threads[g_current];
     for (i = 0; i < MAX_THREADS; i++)
         if (g_threads[i].used && g_threads[i].uid == uid)
             return &g_threads[i];
@@ -173,8 +153,6 @@ static EventFlag *evf_by_uid(int uid)
     return NULL;
 }
 
-/* wait predicates */
-/* SCE_KERNEL_EW_AND / OR / CLEAR_ALL / CLEAR_PAT */
 #define EW_AND       0x00u
 #define EW_OR        0x01u
 #define EW_CLEAR_ALL 0x10u
@@ -249,7 +227,6 @@ static int try_unblock(Thread *t)
     }
 }
 
-/* scheduler: strict priority, round-robin within a priority, lower wins */
 static int pick_next(void)
 {
     int i, best = -1;
@@ -270,8 +247,6 @@ static int pick_next(void)
     return best;
 }
 
-/* Earliest timer deadline among blocked threads; when idle the clock jumps
- * to it (never to host wall time). */
 static int earliest_deadline(u64 *out)
 {
     int i, found = 0;
@@ -286,14 +261,6 @@ static int earliest_deadline(u64 *out)
     return found;
 }
 
-/* Guest polling loops that never block: a loop like the movie player's frame
- * pacer (poll sceDisplayGetVcount, top the mpeg ring up, repeat) only ever
- * calls HLE that costs no emulated time. Under strict priority the poller is
- * the thread that keeps running, so the clock stands still, the vblank that
- * would end the loop never fires, and the process livelocks with nothing
- * logged. Charge a slice after a long unbroken run of calls -- blocking hands
- * the scheduler back, which is what pumps vblank. Deliberately far above any
- * legitimate burst (GE list building) so normal play never trips it. */
 #define HLE_SPIN_CALLS 2048u
 #define HLE_SPIN_US    500u
 
@@ -302,7 +269,7 @@ static unsigned g_calls_since_switch;
 void threadman_note_hle_call(void)
 {
     static int reported;
-    if (g_current < 0) return;                  /* interrupt context */
+    if (g_current < 0) return;
     if (++g_calls_since_switch < HLE_SPIN_CALLS) return;
     if (!reported) {
         reported = 1;
@@ -323,12 +290,6 @@ static int any_waiting_on_vblank(void)
     return 0;
 }
 
-/* Give the slot back: the host fiber, the guest stack, and the entry itself.
- *
- * Never call this from the thread's own fiber -- DeleteFiber on the running
- * fiber terminates the process. sceKernelExitDeleteThread is exactly that
- * case, so it parks itself as a zombie and reap_zombies() does this once the
- * scheduler is back on its own fiber. */
 static void thread_release(Thread *t)
 {
     if (!t->used) return;
@@ -376,10 +337,6 @@ void threadman_yield(void)
     switch_to_scheduler();
 }
 
-/* Block the caller for `usec` of emulated time (the sceKernelDelayThread
- * wait). Blocking HLE calls must use this, not threadman_yield(): a yielding
- * thread is still READY and under strict priority gets re-picked at once, so
- * nothing below its priority ever runs. Yielding is not blocking. */
 void threadman_block_us(u64 usec)
 {
     Thread *t;
@@ -407,31 +364,20 @@ static void fiber_trampoline(void)
         abort();
     }
     fn(&t->ctx, g_ram);
-    /* Falling off the end is an implicit sceKernelExitThread($v0). */
     t->exit_status = (int)t->ctx.r[R_V0];
     t->status = TH_STOPPED;
     t->wait = WAIT_NONE;
     for (;;) switch_to_scheduler();
 }
 
-u32 sysmem_alloc_raw(const char *name, u32 size);    /* sysmem.c */
-u32 sysmem_alloc_high(const char *name, u32 size);   /* sysmem.c */
+u32 sysmem_alloc_raw(const char *name, u32 size);
+u32 sysmem_alloc_high(const char *name, u32 size);
 
-/* The module-start thread (never scheduled; main() runs it directly) owns
- * the topmost stack block; reserving it keeps guest stack addresses matching
- * hardware. 0x400 is the measured gap between its k0 and user_main's. */
 #define MODULE_START_STACK_SIZE 0x400u
+#define DEFAULT_THREAD_STACK_SIZE 0x10000u
+#define HOST_FIBER_COMMIT_BYTES (1024 * 1024)
+#define HOST_FIBER_STACK_BYTES  (8 * 1024 * 1024)
 
-/* Interrupt handlers run on the kernel's own stack. It must NOT come out of
- * the user partition (that shifts every game thread's stack), and it must not
- * come out of the volatile block either: sceKernelVolatileMemLock hands all
- * 4 MB of that to the game, and the asset loader stages whole CHPAK archives
- * across it. This stack used to sit at 0x08700000, three megabytes into that
- * block, so every vblank scribbled a stack frame into the middle of any
- * archive larger than 3 MB; the game's zlib pump then got Z_DATA_ERROR from
- * inflate and, because it only ever breaks on Z_STREAM_END, span forever.
- * So: low kernel space, below the volatile block, clear of the kernel
- * trampolines at 0x08000000..0x08000040. */
 #define INTR_STACK_BASE 0x08300000u
 #define INTR_STACK_SIZE 0x1000u
 
@@ -455,11 +401,10 @@ void threadman_init(u8 *ram, const CpuCtx *boot)
         const char *s = getenv("PSPRECO_MAX_FRAMES");
         if (s) g_max_frames = strtoull(s, NULL, 10);
     }
-    RECOMP_TRACE_CONTEXT(-2, INTR_STACK_BASE,
+    RECOMP_TRACE_CONTEXT(TRACE_CONTEXT_INTERRUPT, INTR_STACK_BASE,
                          INTR_STACK_BASE + INTR_STACK_SIZE, "interrupt");
-    /* The module-start context runs on the kernel's own stack, above every
-     * thread the game creates. */
-    RECOMP_TRACE_CONTEXT(-1, boot->r[R_SP] - 0x1000u, boot->r[R_K0], "boot");
+    RECOMP_TRACE_CONTEXT(TRACE_CONTEXT_BOOT, boot->r[R_SP] - 0x1000u,
+                         boot->r[R_K0], "boot");
 #if defined(_WIN32)
     g_sched_fiber = ConvertThreadToFiber(NULL);
     if (!g_sched_fiber) {
@@ -469,14 +414,10 @@ void threadman_init(u8 *ram, const CpuCtx *boot)
 #endif
 }
 
-/* Bound vblank catch-up so a large clock jump delivers a few handler calls,
- * not thousands. */
 #define VBLANK_MAX_CATCHUP 4
 
 u64 threadman_vblank_count(void) { return g_vblank_count; }
 
-/* PSPRECO_WATCH_U32=addr[,addr...]: report the named guest words whenever
- * they change across frames. */
 #define WATCH_MAX 8
 static void watch_u32_report(void)
 {
@@ -492,7 +433,7 @@ static void watch_u32_report(void)
             char *end;
             addr[count] = (u32)strtoul(e, &end, 0);
             if (end == e) break;
-            last[count] = ~0u;          /* force a first report */
+            last[count] = ~0u;
             count++;
             e = (*end == ',') ? end + 1 : end;
         }
@@ -506,8 +447,6 @@ static void watch_u32_report(void)
     }
 }
 
-/* PSPRECO_THREADDUMP=N: every N frames, print each live thread's status and
- * the object it waits on. */
 static void thread_dump_report(void)
 {
     static int checked;
@@ -580,7 +519,7 @@ static void pump_vblank(void)
         thread_dump_report();
         n++;
     }
-    if (g_clock_us >= g_next_vblank_us)          /* we fell far behind */
+    if (g_clock_us >= g_next_vblank_us)
         g_next_vblank_us = g_clock_us + display_frame_us();
     g_in_vblank = 0;
 
@@ -591,7 +530,6 @@ static void pump_vblank(void)
     }
 }
 
-/* Block until the next vertical blank. */
 void threadman_wait_vblank(void)
 {
     Thread *t;
@@ -601,7 +539,6 @@ void threadman_wait_vblank(void)
     block_current(WAIT_VBLANK);
 }
 
-/* Run until nothing is runnable. */
 void threadman_run(void)
 {
     for (;;) {
@@ -609,9 +546,6 @@ void threadman_run(void)
         pump_vblank();
         next = pick_next();
         if (next < 0) {
-            /* Nobody is runnable. Advance to whichever comes first, the
-             * earliest timer deadline or the next frame boundary; a thread
-             * blocked only on vblank must not deadlock the clock. */
             u64 deadline = 0;
             int have = earliest_deadline(&deadline);
             if (any_waiting_on_vblank()
@@ -621,7 +555,7 @@ void threadman_run(void)
             }
             if (have && deadline > g_clock_us) { g_clock_us = deadline; continue; }
             if (have) continue;
-            return;                     /* deadlock or everything finished */
+            return;
         }
         if (g_exit_requested) return;
 
@@ -633,11 +567,10 @@ void threadman_run(void)
         swapcontext(&g_sched_uctx, &g_threads[next].uctx);
 #endif
         g_current = -1;
-        reap_zombies();     /* safe here and only here: off their fibers */
+        reap_zombies();
     }
 }
 
-/* creation */
 void hle_sceKernelCreateThread(CpuCtx *c, u8 *ram)
 {
     const char *name = hle_cstr(ram, HLE_A0);
@@ -671,10 +604,8 @@ void hle_sceKernelCreateThread(CpuCtx *c, u8 *ram)
     t->entry = entry;
     t->init_priority = t->priority = prio;
     t->attr = attr;
-    t->stack_size = stack ? stack : 0x10000u;
-    t->status = TH_STOPPED;             /* dormant until StartThread */
-    /* Thread stacks come off the TOP of the user partition, downward, in
-     * creation order (SMEM_High) -- matches the hardware layout. */
+    t->stack_size = stack ? stack : DEFAULT_THREAD_STACK_SIZE;
+    t->status = TH_STOPPED;
     t->stack_base = sysmem_alloc_high(t->name, t->stack_size);
     if (!t->stack_base) {
         hle_log("[hle] sceKernelCreateThread(\"%s\"): cannot allocate a "
@@ -691,8 +622,6 @@ void hle_sceKernelCreateThread(CpuCtx *c, u8 *ram)
     HLE_RET(t->uid);
 }
 
-/* The argument block is copied onto the new thread's stack and passed as
- * (argSize, argPointer) in $a0/$a1, per the firmware thread-entry convention. */
 void hle_sceKernelStartThread(CpuCtx *c, u8 *ram)
 {
     Thread *t = thread_by_uid((int)HLE_A0);
@@ -707,9 +636,6 @@ void hle_sceKernelStartThread(CpuCtx *c, u8 *ram)
         return;
     }
     if (t->started) {
-        /* An exited/terminated thread is DORMANT and may be restarted
-         * (games rely on this). Only a still-live thread refuses. The old
-         * fiber is parked in the ExitThread spin; tear it down and restart. */
         if (t->status == TH_STOPPED || t->status == TH_KILLED) {
 #if defined(_WIN32)
             if (t->fiber) { DeleteFiber(t->fiber); t->fiber = NULL; }
@@ -725,10 +651,6 @@ void hle_sceKernelStartThread(CpuCtx *c, u8 *ram)
         }
     }
 
-    /* Entry state (measured; no public header describes the k0 region):
-     *   k0 = top of this thread's stack (per-thread control region)
-     *   sp = k0 - 0x40 - roundup16(argSize),  fp = ra = sp
-     *   a0 = argSize, a1 = sp + 0x40 (copied arg block) or 0 if no args */
     t->tcb = t->stack_base + t->stack_size;
     sp = t->tcb - THREAD_ENTRY_FRAME - ((arg_size + 15u) & ~15u);
     if (arg_size && arg_ptr) {
@@ -753,28 +675,21 @@ void hle_sceKernelStartThread(CpuCtx *c, u8 *ram)
     t->started = 1;
     t->status = TH_READY;
     t->order = ++g_order;
-    /* Stale wait state must not leak into a restarted thread: a leftover
-     * wakeup would satisfy its first sleep immediately. */
     t->wait = WAIT_NONE;
     t->wait_cb = 0;
     t->wakeup_count = 0;
     t->timed_out = 0;
     t->priority = t->init_priority;
 
-    /* Host stacks must absorb the deepest guest call chain PLUS host-side
-     * work done inside HLE handlers on the same stack (the sceMpeg ring-fill
-     * callback re-enters guest code, and the H.264 decoder runs under
-     * AvcDecode). 256 KB overflowed there -- and a fiber stack overflow
-     * kills the process before any crash handler can even run. */
 #if defined(_WIN32)
-    t->fiber = CreateFiberEx(1024 * 1024, 8 * 1024 * 1024, 0,
+    t->fiber = CreateFiberEx(HOST_FIBER_COMMIT_BYTES, HOST_FIBER_STACK_BYTES, 0,
                              fiber_trampoline, t);
     if (!t->fiber) { HLE_RET(SCE_KERNEL_ERROR_NO_MEMORY); return; }
 #else
-    t->host_stack = (char *)malloc(8 * 1024 * 1024);
+    t->host_stack = (char *)malloc(HOST_FIBER_STACK_BYTES);
     getcontext(&t->uctx);
     t->uctx.uc_stack.ss_sp = t->host_stack;
-    t->uctx.uc_stack.ss_size = 8 * 1024 * 1024;
+    t->uctx.uc_stack.ss_size = HOST_FIBER_STACK_BYTES;
     t->uctx.uc_link = &g_sched_uctx;
     makecontext(&t->uctx, fiber_trampoline, 0);
 #endif
@@ -783,7 +698,6 @@ void hle_sceKernelStartThread(CpuCtx *c, u8 *ram)
             t->uid, t->name, arg_size, t->ctx.r[R_SP]);
     HLE_RET(0);
 
-    /* A newly started thread preempts us if it is higher priority. */
     if (g_current >= 0 && t->priority < g_threads[g_current].priority)
         threadman_yield();
 }
@@ -808,11 +722,6 @@ void hle_sceKernelExitDeleteThread(CpuCtx *c, u8 *ram)
     t->exit_status = (int)HLE_A0;
     t->status = TH_KILLED;
     t->wait = WAIT_NONE;
-    /* The slot cannot be freed here -- we are standing on this thread's own
-     * fiber. Mark it and let the scheduler reap it, or the slot and its guest
-     * stack leak: the game creates a ThreadLoadMain per load and exits it this
-     * way, so 128 loads used to end in "no free thread slot" and a loading
-     * screen that never finishes. */
     t->zombie = 1;
     hle_log("[hle] sceKernelExitDeleteThread(%d) from \"%s\"",
             t->exit_status, t->name);
@@ -838,8 +747,6 @@ void hle_sceKernelTerminateDeleteThread(CpuCtx *c, u8 *ram)
     hle_log("[hle] sceKernelTerminateDeleteThread(%d /* %s */)", t->uid, t->name);
     t->status = TH_KILLED;
     t->wait = WAIT_NONE;
-    /* Terminating yourself is legal; that one has to be deferred like
-     * sceKernelExitDeleteThread, for the same fiber reason. */
     if (g_current >= 0 && t == &g_threads[g_current]) t->zombie = 1;
     else thread_release(t);
     HLE_RET(0);
@@ -937,7 +844,6 @@ void hle_sceKernelGetThreadCurrentPriority(CpuCtx *c, u8 *ram)
     HLE_RET(g_current >= 0 ? (u32)g_threads[g_current].priority : 0u);
 }
 
-/* semaphores */
 void hle_sceKernelCreateSema(CpuCtx *c, u8 *ram)
 {
     const char *name = hle_cstr(ram, HLE_A0);
@@ -995,7 +901,13 @@ static void wait_sema_common(CpuCtx *c, u8 *ram, int with_cb)
 void hle_sceKernelWaitSema(CpuCtx *c, u8 *ram)   { wait_sema_common(c, ram, 0); }
 void hle_sceKernelWaitSemaCB(CpuCtx *c, u8 *ram) { wait_sema_common(c, ram, 1); }
 
-/* event flags */
+#define EVFINFO_SIZE                    52u
+#define EVFINFO_OFF_SIZE                0
+#define EVFINFO_OFF_ATTR                36
+#define EVFINFO_OFF_INIT_PATTERN        40
+#define EVFINFO_OFF_CUR_PATTERN         44
+#define EVFINFO_OFF_NUM_WAIT_THREADS    48
+
 void hle_sceKernelCreateEventFlag(CpuCtx *c, u8 *ram)
 {
     const char *name = hle_cstr(ram, HLE_A0);
@@ -1074,19 +986,16 @@ void hle_sceKernelReferEventFlagStatus(CpuCtx *c, u8 *ram)
     EventFlag *e = evf_by_uid((int)HLE_A0);
     u32 info = HLE_A1;
     if (!e) { HLE_RET(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
-    /* SceKernelEventFlagInfo: size, name[32], attr, initPattern,
-     * currentPattern, numWaitThreads. */
     if (info) {
-        mem_w32(ram, info + 0, 52u);
-        mem_w32(ram, info + 36, e->attr);
-        mem_w32(ram, info + 40, e->pattern);
-        mem_w32(ram, info + 44, e->pattern);
-        mem_w32(ram, info + 48, 0u);
+        mem_w32(ram, info + EVFINFO_OFF_SIZE, EVFINFO_SIZE);
+        mem_w32(ram, info + EVFINFO_OFF_ATTR, e->attr);
+        mem_w32(ram, info + EVFINFO_OFF_INIT_PATTERN, e->pattern);
+        mem_w32(ram, info + EVFINFO_OFF_CUR_PATTERN, e->pattern);
+        mem_w32(ram, info + EVFINFO_OFF_NUM_WAIT_THREADS, 0u);
     }
     HLE_RET(0);
 }
 
-/* callbacks */
 void hle_sceKernelCreateCallback(CpuCtx *c, u8 *ram)
 {
     const char *name = hle_cstr(ram, HLE_A0);
@@ -1104,10 +1013,6 @@ void hle_sceKernelCreateCallback(CpuCtx *c, u8 *ram)
     HLE_RET(g_cbs[slot].uid);
 }
 
-/* Guest signature: int cb(int arg1, int arg2, void *common). The kernel runs
- * a callback inline on the registering thread, with the caller's context
- * saved and restored around it. */
-/* Pending notifications, delivered at the next callback point. */
 #define MAX_PENDING_CB 32
 typedef struct { int used; int cbid; u32 a1, a2; } PendingCb;
 static PendingCb g_pending_cb[MAX_PENDING_CB];
@@ -1127,8 +1032,6 @@ void threadman_notify_callback(int cbid, u32 a1, u32 a2)
             cbid);
 }
 
-/* A callback fires only at a callback point (inside the ...CB wait
- * variants), never at the moment it is registered. */
 int threadman_deliver_callbacks(CpuCtx *c, u8 *ram)
 {
     int i, n = 0;
@@ -1158,9 +1061,6 @@ int threadman_invoke_callback(CpuCtx *c, u8 *ram, int cbid, u32 a1, u32 a2)
         recomp_trap_unknown_indirect(c, ram, c->r[R_RA], cb->func);
         return 0;
     }
-    /* The kernel dispatcher spends 0x80 bytes of the interrupted thread's
-     * stack and installs $ra = 0x08000018 (measured); matching both keeps
-     * our stack addresses identical to hardware's. */
     saved = *c;
     c->r[R_SP] = saved.r[R_SP] - KERNEL_CALLBACK_FRAME;
     c->r[R_RA] = KERNEL_CALLBACK_RETURN;
@@ -1174,11 +1074,10 @@ int threadman_invoke_callback(CpuCtx *c, u8 *ram, int cbid, u32 a1, u32 a2)
     return 1;
 }
 
-/* system time */
 void hle_sceKernelGetSystemTime(CpuCtx *c, u8 *ram)
 {
     u32 p = HLE_A0;
-    if (p) {                       /* SceKernelSysClock is a 64-bit usec count */
+    if (p) {
         mem_w32(ram, p + 0, (u32)(g_clock_us & 0xFFFFFFFFu));
         mem_w32(ram, p + 4, (u32)(g_clock_us >> 32));
     }
@@ -1197,23 +1096,34 @@ void hle_sceKernelGetSystemTimeLow(CpuCtx *c, u8 *ram)
     HLE_RET((u32)(g_clock_us & 0xFFFFFFFFu));
 }
 
-/* thread status */
+#define RUNSTATUS_SIZE                    40u
+#define RUNSTATUS_OFF_SIZE                0
+#define RUNSTATUS_OFF_STATUS              4
+#define RUNSTATUS_OFF_PRIORITY            8
+#define RUNSTATUS_OFF_WAITTYPE            12
+#define RUNSTATUS_OFF_WAITID              16
+#define RUNSTATUS_OFF_EXITSTATUS          20
+#define RUNSTATUS_OFF_RUNCLOCKS_LO        24
+#define RUNSTATUS_OFF_RUNCLOCKS_HI        28
+#define RUNSTATUS_OFF_INTR_PREEMPT_COUNT  32
+#define RUNSTATUS_OFF_THREAD_PREEMPT_COUNT 36
+
 void hle_sceKernelReferThreadRunStatus(CpuCtx *c, u8 *ram)
 {
     Thread *t = thread_by_uid((int)HLE_A0);
     u32 info = HLE_A1;
     if (!t) { HLE_RET(SCE_KERNEL_ERROR_UNKNOWN_THID); return; }
     if (info) {
-        mem_w32(ram, info + 0, 40u);          /* size            */
-        mem_w32(ram, info + 4, (u32)t->status);
-        mem_w32(ram, info + 8, (u32)t->priority);
-        mem_w32(ram, info + 12, (u32)t->wait);
-        mem_w32(ram, info + 16, 0u);          /* waitId          */
-        mem_w32(ram, info + 20, 0u);          /* exitStatus      */
-        mem_w32(ram, info + 24, 0u);          /* runClocks lo    */
-        mem_w32(ram, info + 28, 0u);          /* runClocks hi    */
-        mem_w32(ram, info + 32, 0u);          /* intrPreemptCount*/
-        mem_w32(ram, info + 36, 0u);          /* threadPreemptCount */
+        mem_w32(ram, info + RUNSTATUS_OFF_SIZE, RUNSTATUS_SIZE);
+        mem_w32(ram, info + RUNSTATUS_OFF_STATUS, (u32)t->status);
+        mem_w32(ram, info + RUNSTATUS_OFF_PRIORITY, (u32)t->priority);
+        mem_w32(ram, info + RUNSTATUS_OFF_WAITTYPE, (u32)t->wait);
+        mem_w32(ram, info + RUNSTATUS_OFF_WAITID, 0u);
+        mem_w32(ram, info + RUNSTATUS_OFF_EXITSTATUS, 0u);
+        mem_w32(ram, info + RUNSTATUS_OFF_RUNCLOCKS_LO, 0u);
+        mem_w32(ram, info + RUNSTATUS_OFF_RUNCLOCKS_HI, 0u);
+        mem_w32(ram, info + RUNSTATUS_OFF_INTR_PREEMPT_COUNT, 0u);
+        mem_w32(ram, info + RUNSTATUS_OFF_THREAD_PREEMPT_COUNT, 0u);
     }
     HLE_RET(0);
 }

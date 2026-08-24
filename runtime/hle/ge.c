@@ -1,11 +1,3 @@
-/* runtime/hle/ge.c  <-  include/geman.h (+ gecmd.h)
- *
- * sceGe_user. Runs the display list's CONTROL FLOW only -- BASE, JUMP, BJUMP,
- * CALL, RET, END, FINISH, SIGNAL -- maintains list state, and raises the
- * finish interrupt whose callback drives the game's frame loop.
- * Rasterisation lives in runtime/gpu/.
- */
-
 #include "hle.h"
 #include "sce_errors.h"
 #include "threadman.h"
@@ -13,11 +5,9 @@
 
 #include <stdio.h>
 
-/* eDRAM: 2 MB at 0x04000000, as sceGeEdramGetAddr returns on hardware. */
 #define PSP_EDRAM_ADDR 0x04000000u
 #define PSP_EDRAM_SIZE 0x00200000u
 
-/* --- command ids (gecmd.h) ---------------------------------------------- */
 #define GE_CMD_NOP     0x00
 #define GE_CMD_PRIM    0x04
 #define GE_CMD_JUMP    0x08
@@ -30,20 +20,15 @@
 #define GE_CMD_BASE    0x10
 #define GE_CMD_ORIGIN  0x14
 
-/* Command word: [31:24] id, [23:0] payload. An address payload is the low 24
- * bits of the target; BASE supplies bits [27:24] from its payload bits
- * [19:16]. */
 #define GE_ADDR24(w)   ((w) & 0x00FFFFFCu)
 #define GE_BASE_OF(w)  ((((w) >> 16) & 0x0Fu) << 24)
 
-/* --- list states (geman.h) ---------------------------------------------- */
 #define SCE_GE_LIST_COMPLETED 0
 #define SCE_GE_LIST_QUEUED    1
 #define SCE_GE_LIST_DRAWING   2
 #define SCE_GE_LIST_STALLING  3
 #define SCE_GE_LIST_PAUSED    4
 
-/* --- callback registration ---------------------------------------------- */
 typedef struct {
     int used;
     int id;
@@ -63,16 +48,15 @@ static GeCallback *ge_cb_by_id(int id)
     return NULL;
 }
 
-/* --- lists -------------------------------------------------------------- */
 typedef struct {
     int used;
     int id;
     int state;
     int cbid;
-    u32 madr;          /* where the list started */
+    u32 madr;
     u32 stall;
-    u32 pc;            /* where execution stopped, for a stalled list */
-    int finish_code;   /* FINISH's 24-bit payload, -1 if it never finished */
+    u32 pc;
+    int finish_code;
 } GeList;
 
 #define MAX_GE_LIST 64
@@ -88,10 +72,6 @@ static GeList *list_by_id(int id)
     return NULL;
 }
 
-/* --- pending interrupts ------------------------------------------------- */
-/* Lists run synchronously inside sceGeListEnQueue, so finish/signal callbacks
- * are queued here and delivered from interrupt context at the next vblank --
- * never inline from inside the game's own call, which hardware never does. */
 typedef struct { int used; u32 func, cookie; int code; u32 madr; } GeIntr;
 
 #define MAX_GE_INTR 16
@@ -113,8 +93,6 @@ static void queue_ge_intr(u32 func, u32 cookie, int code, u32 madr)
     hle_log("[ge] interrupt queue full, dropping a callback for %08x", func);
 }
 
-/* Both callbacks: void (*)(int intrcode, void *cookie, const void *madr).
- * Called from interrupt context by the vblank pump. */
 int ge_deliver_interrupts(CpuCtx *c, u8 *ram)
 {
     int i, n = 0;
@@ -141,17 +119,10 @@ int ge_deliver_interrupts(CpuCtx *c, u8 *ram)
     return n;
 }
 
-/* --- the list processor -------------------------------------------------- */
-/* Non-control-flow commands set GE state. Bounded two ways -- a command
- * budget and a CALL stack depth -- so a malformed or self-jumping list says
- * so rather than wedging the emulator. */
 #define GE_MAX_COMMANDS 2000000u
 #define GE_STACK_DEPTH  32
 
-/* Every command id the title has ever issued; reported at shutdown as the
- * measured work list for rasterisation. */
 static unsigned g_cmd_seen[256];
-/* Of those, the ones runtime/gpu/ge_raster.c does not model yet. */
 static unsigned g_cmd_unmodelled[256];
 
 void ge_report_command_usage(void)
@@ -176,7 +147,7 @@ typedef struct {
     unsigned commands;
     unsigned prims;
     int      hit_limit;
-    unsigned by_cmd[256];      /* which command ids the list actually uses */
+    unsigned by_cmd[256];
 } GeStats;
 
 static void run_list(u8 *ram, GeList *l, GeStats *st)
@@ -200,8 +171,6 @@ static void run_list(u8 *ram, GeList *l, GeStats *st)
     for (;;) {
         u32 w, cmd, payload;
 
-        /* pSadr is the stall address: stop there and wait for the list to be
-         * extended; 0 means "run to the end". */
         if (l->stall && pc == l->stall) {
             l->state = SCE_GE_LIST_STALLING;
             break;
@@ -236,8 +205,6 @@ static void run_list(u8 *ram, GeList *l, GeStats *st)
             pc = base | GE_ADDR24(w);
             break;
         case GE_CMD_BJUMP:
-            /* Bounding-box conditional jump; without the geometry test, not
-             * taking it is conservative: draws everything, never skips. */
             break;
         case GE_CMD_CALL:
             if (sp >= GE_STACK_DEPTH) {
@@ -259,7 +226,6 @@ static void run_list(u8 *ram, GeList *l, GeStats *st)
             pc = stack[--sp];
             break;
         case GE_CMD_SIGNAL:
-            /* Raises the signal interrupt with this payload. */
             {
                 GeCallback *cb = ge_cb_by_id(l->cbid);
                 if (cb)
@@ -268,21 +234,15 @@ static void run_list(u8 *ram, GeList *l, GeStats *st)
             }
             break;
         case GE_CMD_FINISH:
-            /* Marks end of drawing; the finish interrupt carries this
-             * payload as its intrcode. The following END stops the list. */
             l->finish_code = (int)payload;
             break;
         case GE_CMD_END:
             l->state = SCE_GE_LIST_COMPLETED;
             l->pc = pc;
             st->commands = n;
-            /* End of list: the GPU backend's batched work must become
-             * observable here. */
             ge_gpu_flush("listend");
             return;
         default:
-            /* State-setting command; runtime/gpu/ge.c models what
-             * rasterisation needs and reports what it did not recognise. */
             if (!ge_state_command(ram, w, base)) g_cmd_unmodelled[cmd]++;
             break;
         }
@@ -300,7 +260,6 @@ static void report_first_list(const GeList *l, const GeStats *st)
            l->id, l->madr, st->commands, st->prims,
            l->state == SCE_GE_LIST_COMPLETED ? "ended with END"
                                              : "stopped at the stall address");
-    /* The measured command set the title needs for rasterisation. */
     {
         int i;
         printf("command ids used:");
@@ -309,8 +268,6 @@ static void report_first_list(const GeList *l, const GeStats *st)
         printf("\n=======================================================\n\n");
     }
 }
-
-/* --- entry points -------------------------------------------------------- */
 
 void hle_sceGeEdramGetAddr(CpuCtx *c, u8 *ram)
 {
@@ -324,7 +281,6 @@ void hle_sceGeEdramGetSize(CpuCtx *c, u8 *ram)
     HLE_RET(PSP_EDRAM_SIZE);
 }
 
-/* SceGeCbParam: { pSignalFunc, pSignalCookie, pFinishFunc, pFinishCookie } */
 void hle_sceGeSetCallback(CpuCtx *c, u8 *ram)
 {
     u32 p = HLE_A0;
@@ -356,8 +312,6 @@ void hle_sceGeUnsetCallback(CpuCtx *c, u8 *ram)
     HLE_RET(0);
 }
 
-/* Microsecond host clock for the GE budget split. Measured once per list, so
- * the query cost does not matter; resolution does, which rules out clock(). */
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
@@ -383,7 +337,6 @@ static u64 ge_time_us(void)
 }
 #endif
 
-/* Accumulated in runtime/gpu/ge_render.c, reported by the [fps] line. */
 extern unsigned long g_ge_us_acc;
 
 void hle_sceGeListEnQueue(CpuCtx *c, u8 *ram)
@@ -395,8 +348,6 @@ void hle_sceGeListEnQueue(CpuCtx *c, u8 *ram)
     GeList *l = NULL;
     int i;
 
-    /* Reuse a completed slot before taking a fresh one: a frame loop queues
-     * one list per frame forever, and the table must not fill up. */
     for (i = 0; i < MAX_GE_LIST; i++)
         if (!g_lists[i].used) { l = &g_lists[i]; break; }
     if (!l)
@@ -419,7 +370,7 @@ void hle_sceGeListEnQueue(CpuCtx *c, u8 *ram)
     l->stall = stall;
     l->state = SCE_GE_LIST_QUEUED;
 
-    {   /* Once per list (about four a frame), so the measurement is free. */
+    {
         u64 t0 = ge_time_us();
         run_list(ram, l, &st);
         g_ge_us_acc += (unsigned long)(ge_time_us() - t0);
@@ -443,7 +394,6 @@ void hle_sceGeListEnQueue(CpuCtx *c, u8 *ram)
     HLE_RET(l->id);
 }
 
-/* Extending a stalled list resumes it from where the read pointer stopped. */
 void hle_sceGeListUpdateStallAddr(CpuCtx *c, u8 *ram)
 {
     GeList *l = list_by_id((int)HLE_A0);
@@ -454,7 +404,7 @@ void hle_sceGeListUpdateStallAddr(CpuCtx *c, u8 *ram)
     if (l->state == SCE_GE_LIST_STALLING) {
         u32 resume = l->pc;
         l->madr = resume;
-        {   /* Once per list (about four a frame), so the measurement is free. */
+        {
         u64 t0 = ge_time_us();
         run_list(ram, l, &st);
         g_ge_us_acc += (unsigned long)(ge_time_us() - t0);
@@ -469,8 +419,6 @@ void hle_sceGeListUpdateStallAddr(CpuCtx *c, u8 *ram)
     HLE_RET(0);
 }
 
-/* Lists run to completion inside EnQueue, so a list is either COMPLETED or
- * STALLING. */
 void hle_sceGeListSync(CpuCtx *c, u8 *ram)
 {
     GeList *l = list_by_id((int)HLE_A0);
@@ -479,10 +427,6 @@ void hle_sceGeListSync(CpuCtx *c, u8 *ram)
     HLE_RET(l->state);
 }
 
-/* Every list has already run, but the finish interrupt may not have been
- * delivered yet; deliver here as well as at vblank so state read after
- * DrawSync is never stale -- on hardware the interrupt has certainly been
- * raised by the time the queue drains. */
 void hle_sceGeDrawSync(CpuCtx *c, u8 *ram)
 {
     ge_deliver_interrupts(c, ram);

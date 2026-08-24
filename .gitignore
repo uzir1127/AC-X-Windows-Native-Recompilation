@@ -14,3 +14,11 @@ EBOOT.elf
 *.CDI
 game/
 memstick/
+logs/
+EBOOT.elf.i64
+EBOOT.elf.id0
+EBOOT.elf.id1
+EBOOT.elf.id2
+EBOOT.elf.nam
+EBOOT.elf.til
+*.i64

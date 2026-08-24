@@ -1,5 +1,3 @@
-/* runtime/gpu/framedump.h -- write the display frame buffer to a BMP.
- * See runtime/gpu/framedump.c. */
 #ifndef PSPRECO_FRAMEDUMP_H
 #define PSPRECO_FRAMEDUMP_H
 

@@ -1,12 +1,10 @@
-/* runtime/host/at3_decode.cpp -- ATRAC3/ATRAC3plus decode. See at3_decode.h.
- * Backed by third_party/ppsspp/at3_standalone: PPSSPP's standalone extraction
- * of ffmpeg's atrac3/atrac3plus decoders (GPLv2+). C++ TU; exports plain C. */
-
 #include "at3_decode.h"
 
 #include <stdlib.h>
 
 #include "../../third_party/ppsspp/at3_standalone/at3_decoders.h"
+
+#define AT3_SAMPLES_PER_FRAME 2048
 
 struct At3Handle {
     ATRAC3Context *at3;
@@ -36,9 +34,7 @@ extern "C" At3Handle *at3_open(int is_plus, const unsigned char *extradata,
 extern "C" int at3_decode_frame(At3Handle *h, const unsigned char *in,
                                 int in_size, short *out, int out_cap)
 {
-    /* The decoder memcpys into CALLER-owned planes (2048 samples/frame);
-     * HLE handlers are serialised on the fiber scheduler, so statics are ok. */
-    static float plane_l[2048], plane_r[2048];
+    static float plane_l[AT3_SAMPLES_PER_FRAME], plane_r[AT3_SAMPLES_PER_FRAME];
     float *planes[2] = { plane_l, plane_r };
     int n = 0, r, i;
 

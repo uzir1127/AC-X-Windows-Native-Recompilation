@@ -1,7 +1,3 @@
-/* runtime/host/osk_win.c -- native text entry standing in for the PSP OSK.
- * A blocking modal dialog is behaviourally equivalent: the game polls
- * OskGetStatus and sees FINISHED once the user confirms. */
-
 #include "osk_host.h"
 
 #ifdef _WIN32
@@ -13,10 +9,18 @@
 #define ID_EDIT 100
 #define ID_DESC 101
 
+#define DLG_NO_MENU         0
+#define DLG_DEFAULT_CLASS   0
+#define DLG_FONT_POINT_SIZE 9
+
+#define ATOM_BUTTON 0x0080
+#define ATOM_EDIT   0x0081
+#define ATOM_STATIC 0x0082
+
 typedef struct {
     const WCHAR *initial;
     WCHAR *out;
-    int cap;            /* characters including terminator */
+    int cap;
 } OskCtx;
 
 static INT_PTR CALLBACK osk_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
@@ -30,7 +34,7 @@ static INT_PTR CALLBACK osk_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
                             (WPARAM)(ctx->cap - 1), 0);
         SendDlgItemMessageW(dlg, ID_EDIT, EM_SETSEL, 0, -1);
         SetFocus(GetDlgItem(dlg, ID_EDIT));
-        return FALSE;                       /* we set focus ourselves */
+        return FALSE;
     case WM_COMMAND:
         if (LOWORD(wp) == IDOK) {
             GetDlgItemTextW(dlg, ID_EDIT, ctx->out, ctx->cap);
@@ -43,13 +47,12 @@ static INT_PTR CALLBACK osk_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
     return FALSE;
 }
 
-/* Append a WORD-aligned item to the in-memory dialog template. */
 static WORD *dlg_item(WORD *p, DWORD style, short x, short y, short cx,
                       short cy, WORD id, WORD cls, const WCHAR *text)
 {
     DLGITEMTEMPLATE *it;
     size_t n;
-    p = (WORD *)(((UINT_PTR)p + 3) & ~(UINT_PTR)3);     /* DWORD align */
+    p = (WORD *)(((UINT_PTR)p + 3) & ~(UINT_PTR)3);
     it = (DLGITEMTEMPLATE *)p;
     it->style = style;
     it->dwExtendedStyle = 0;
@@ -57,11 +60,11 @@ static WORD *dlg_item(WORD *p, DWORD style, short x, short y, short cx,
     it->id = id;
     p = (WORD *)(it + 1);
     *p++ = 0xFFFF;
-    *p++ = cls;                                         /* system class atom */
+    *p++ = cls;
     n = wcslen(text) + 1;
     memcpy(p, text, n * 2);
     p += n;
-    *p++ = 0;                                           /* no creation data */
+    *p++ = 0;
     return p;
 }
 
@@ -83,23 +86,23 @@ int osk_host_input(const unsigned short *desc, const unsigned short *initial,
     t->cdit = 4;
     t->x = 0; t->y = 0; t->cx = 220; t->cy = 74;
     p = (WORD *)(t + 1);
-    *p++ = 0;                                           /* no menu */
-    *p++ = 0;                                           /* default class */
+    *p++ = DLG_NO_MENU;
+    *p++ = DLG_DEFAULT_CLASS;
     { const WCHAR *s = L"Enter text"; size_t n = wcslen(s) + 1;
       memcpy(p, s, n * 2); p += n; }
-    *p++ = 9;                                           /* 9pt (DS_SETFONT) */
+    *p++ = DLG_FONT_POINT_SIZE;
     { const WCHAR *s = L"Segoe UI"; size_t n = wcslen(s) + 1;
       memcpy(p, s, n * 2); p += n; }
 
     p = dlg_item(p, WS_CHILD | WS_VISIBLE | SS_LEFT, 8, 6, 204, 10, ID_DESC,
-                 0x0082, (desc && *desc) ? (const WCHAR *)desc
-                                         : L"Enter a name:");
+                 ATOM_STATIC, (desc && *desc) ? (const WCHAR *)desc
+                                              : L"Enter a name:");
     p = dlg_item(p, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP
-                 | ES_AUTOHSCROLL, 8, 20, 204, 13, ID_EDIT, 0x0081, L"");
+                 | ES_AUTOHSCROLL, 8, 20, 204, 13, ID_EDIT, ATOM_EDIT, L"");
     p = dlg_item(p, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                 102, 50, 52, 15, IDOK, 0x0080, L"OK");
+                 102, 50, 52, 15, IDOK, ATOM_BUTTON, L"OK");
     p = dlg_item(p, WS_CHILD | WS_VISIBLE | WS_TABSTOP, 160, 50, 52, 15,
-                 IDCANCEL, 0x0080, L"Cancel");
+                 IDCANCEL, ATOM_BUTTON, L"Cancel");
     (void)p;
 
     ctx.initial = (const WCHAR *)initial;

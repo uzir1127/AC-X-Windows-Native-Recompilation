@@ -1,11 +1,3 @@
-/* runtime/host/h264_dec.c -- Media Foundation H.264 decode. See h264_dec.h.
- *
- * The MS H.264 decoder MFT takes Annex-B input one access unit per sample;
- * a small assembler below splits the fed byte stream into AUs (a new AU
- * starts at a slice NAL whose first_mb_in_slice is 0, with any preceding
- * SPS/PPS/SEI grouped onto it). Output is NV12, converted per frame into the
- * guest buffer in the requested PSP pixel mode. */
-
 #include "h264_dec.h"
 
 #include <stdio.h>
@@ -23,7 +15,6 @@
 #include <mftransform.h>
 #include <mferror.h>
 
-/* wmcodecdsp.h's CLSID, defined locally so no extra header/link is needed. */
 DEFINE_GUID(k_CLSID_CMSH264DecoderMFT,
             0x62CE7E72, 0x4C71, 0x4d20,
             0xB1, 0x5D, 0x45, 0x28, 0x31, 0xA8, 0x7D, 0x9D);
@@ -34,36 +25,43 @@ DEFINE_GUID(k_MF_LOW_LATENCY,
 struct H264Dec {
     IMFTransform *xf;
     int failed;
-    int out_w, out_h;          /* negotiated output size */
+    int out_w, out_h;
     int out_stride;
     int drained;
 
-    /* reusable output sample (this MFT wants caller-allocated samples) */
     IMFSample *out_sample;
     IMFMediaBuffer *out_buf;
     DWORD out_buf_size;
 
-    /* input ES fifo + AU assembler */
     uint8_t *es;
     uint32_t es_len, es_cap, es_pos;
-    int saw_aud;               /* stream uses AUD delimiters */
-    LONGLONG fake_ts;          /* monotonic timestamps the MFT wants */
+    int saw_aud;
+    LONGLONG fake_ts;
 };
 
-static int g_mf_state;         /* 0 untried, 1 up, -1 failed */
+enum { MF_UNTRIED = 0, MF_UP = 1, MF_FAILED = -1 };
+static int g_mf_state;
+
+#define NAL_TYPE_MASK             0x1F
+#define NAL_TYPE_SLICE_NON_IDR    1
+#define NAL_TYPE_SLICE_IDR        5
+#define NAL_TYPE_AUD              9
+#define FIRST_MB_IN_SLICE_ZERO_BIT 0x80
+
+#define ES_COMPACT_THRESHOLD      (1u << 20)
+#define AU_WAIT_MAX_PENDING       (1u << 20)
+#define FRAME_DURATION_100NS      333667
 
 static int mf_up(void)
 {
-    if (g_mf_state) return g_mf_state > 0;
-    g_mf_state = -1;
-    if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) {
-        /* RPC_E_CHANGED_MODE etc: an apartment already exists, keep going */
-    }
+    if (g_mf_state != MF_UNTRIED) return g_mf_state == MF_UP;
+    g_mf_state = MF_FAILED;
+    (void)CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) {
         fprintf(stderr, "[h264] MFStartup failed; movies will be blank\n");
         return 0;
     }
-    g_mf_state = 1;
+    g_mf_state = MF_UP;
     return 1;
 }
 
@@ -83,8 +81,6 @@ static int set_types(H264Dec *d)
     return set_output_type(d);
 }
 
-/* Pick the NV12 output the decoder offers. Called alone on stream change --
- * re-setting the input type there would reset the decoder and loop. */
 static int set_output_type(H264Dec *d)
 {
     IMFMediaType *t = NULL;
@@ -181,10 +177,6 @@ void h264_feed(H264Dec *d, const uint8_t *data, uint32_t len)
     d->es_len += len;
 }
 
-/* --- AU assembly -------------------------------------------------------- */
-
-/* Next start code at/after `from`; es_len if none. Also reports its length
- * (3 or 4 bytes). */
 static uint32_t next_sc(const H264Dec *d, uint32_t from, int *sclen)
 {
     const uint8_t *p = d->es;
@@ -203,26 +195,18 @@ static uint32_t next_sc(const H264Dec *d, uint32_t from, int *sclen)
     return d->es_len;
 }
 
-/* Does the NAL at `pos` (start-code offset) begin a new access unit?
- * PSMF streams delimit every AU with an AUD NAL (type 9), the cleanest
- * boundary; the slice test (types 1/5 with first_mb_in_slice == 0, i.e.
- * first exp-golomb bit set) is the fallback for streams without AUDs. */
 static int is_new_picture(const H264Dec *d, uint32_t pos, int sclen)
 {
     uint32_t h = pos + (uint32_t)sclen;
     int type;
     if (h + 1 >= d->es_len) return 0;
-    type = d->es[h] & 0x1F;
-    if (type == 9) return 1;
+    type = d->es[h] & NAL_TYPE_MASK;
+    if (type == NAL_TYPE_AUD) return 1;
     if (d->saw_aud) return 0;
-    if (type != 1 && type != 5) return 0;
-    return (d->es[h + 1] & 0x80) != 0;
+    if (type != NAL_TYPE_SLICE_NON_IDR && type != NAL_TYPE_SLICE_IDR) return 0;
+    return (d->es[h + 1] & FIRST_MB_IN_SLICE_ZERO_BIT) != 0;
 }
 
-/* Extract the next complete AU: [au_start, au_end). An AU runs from one
- * new-picture boundary (with any SPS/PPS/SEI immediately before it grouped
- * in) to the next. Returns 1 with the range set, 0 when more data is
- * needed (unless eos, which flushes the tail). */
 static int next_au(H264Dec *d, int eos, uint32_t *start, uint32_t *end)
 {
     uint32_t pos = d->es_pos, first_pic = 0, scan;
@@ -232,7 +216,6 @@ static int next_au(H264Dec *d, int eos, uint32_t *start, uint32_t *end)
     if (scan >= d->es_len) return 0;
     pos = scan;
 
-    /* find the first new-picture slice at/after pos */
     for (scan = pos; scan < d->es_len; ) {
         if (is_new_picture(d, scan, sclen)) { first_pic = scan; have_pic = 1; break; }
         scan = next_sc(d, scan + 3, &sclen);
@@ -247,13 +230,11 @@ static int next_au(H264Dec *d, int eos, uint32_t *start, uint32_t *end)
         return 0;
     }
 
-    /* AU ends at the NEXT new-picture boundary */
     scan = next_sc(d, first_pic + 3, &sclen);
     while (scan < d->es_len && !is_new_picture(d, scan, sclen))
         scan = next_sc(d, scan + 3, &sclen);
     if (scan >= d->es_len && !eos) {
-        /* incomplete: unless we already hold a lot, wait for the boundary */
-        if (d->es_len - d->es_pos < (1u << 20)) return 0;
+        if (d->es_len - d->es_pos < AU_WAIT_MAX_PENDING) return 0;
     }
     *start = d->es_pos;
     *end = (scan < d->es_len) ? scan : d->es_len;
@@ -263,20 +244,17 @@ static int next_au(H264Dec *d, int eos, uint32_t *start, uint32_t *end)
 
 static void es_compact(H264Dec *d)
 {
-    if (d->es_pos < (1u << 20)) return;
+    if (d->es_pos < ES_COMPACT_THRESHOLD) return;
     memmove(d->es, d->es + d->es_pos, d->es_len - d->es_pos);
     d->es_len -= d->es_pos;
     d->es_pos = 0;
 }
-
-/* --- output conversion -------------------------------------------------- */
 
 static uint8_t clamp8(int v)
 {
     return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v;
 }
 
-/* NV12 -> PSP pixel format (BT.601 limited range). */
 static void convert_nv12(const uint8_t *y_base, int y_stride,
                          const uint8_t *uv_base, int uv_stride,
                          int w, int h, uint8_t *dst, int frameWidth,
@@ -320,7 +298,6 @@ static void convert_nv12(const uint8_t *y_base, int y_stride,
     }
 }
 
-/* --- decode pump -------------------------------------------------------- */
 
 static int send_au(H264Dec *d, const uint8_t *au, uint32_t len)
 {
@@ -344,20 +321,19 @@ static int send_au(H264Dec *d, const uint8_t *au, uint32_t len)
     IMFMediaBuffer_SetCurrentLength(mb, len);
     IMFSample_AddBuffer(smp, mb);
     IMFSample_SetSampleTime(smp, d->fake_ts);
-    IMFSample_SetSampleDuration(smp, 333667);      /* ~29.97 fps in 100 ns */
-    d->fake_ts += 333667;
+    IMFSample_SetSampleDuration(smp, FRAME_DURATION_100NS);
+    d->fake_ts += FRAME_DURATION_100NS;
 
     hr = IMFTransform_ProcessInput(d->xf, 0, smp, 0);
     IMFMediaBuffer_Release(mb);
     IMFSample_Release(smp);
-    if (hr == MF_E_NOTACCEPTING) return 0;         /* drain output first */
+    if (hr == MF_E_NOTACCEPTING) return 0;
     if (FAILED(hr))
         fprintf(stderr, "[h264] ProcessInput hr=0x%08lx len=%u\n",
                 (unsigned long)hr, (unsigned)len);
     return SUCCEEDED(hr) ? 1 : -1;
 }
 
-/* (Re)allocate the reusable output sample to the MFT's required size. */
 static int ensure_out_sample(H264Dec *d)
 {
     MFT_OUTPUT_STREAM_INFO info;
@@ -366,7 +342,6 @@ static int ensure_out_sample(H264Dec *d)
     if (FAILED(IMFTransform_GetOutputStreamInfo(d->xf, 0, &info))) return 0;
     if (info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
                         | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) {
-        /* transform allocates: nothing to do */
         if (d->out_sample) { IMFSample_Release(d->out_sample); d->out_sample = NULL; }
         if (d->out_buf) { IMFMediaBuffer_Release(d->out_buf); d->out_buf = NULL; }
         return 1;
@@ -386,7 +361,6 @@ static int ensure_out_sample(H264Dec *d)
     return 1;
 }
 
-/* Try to pull one output frame. 1 = written, 0 = needs input, -1 = error. */
 static int recv_frame(H264Dec *d, uint8_t *dst, int frameWidth, int pixelMode)
 {
     MFT_OUTPUT_DATA_BUFFER out;
@@ -394,11 +368,9 @@ static int recv_frame(H264Dec *d, uint8_t *dst, int frameWidth, int pixelMode)
     HRESULT hr;
 
     if (!ensure_out_sample(d)) return -1;
-    /* Reset the reusable buffer: a nonzero current length from the previous
-     * frame makes the MFT skip writing (it looks already-filled). */
     if (d->out_buf) IMFMediaBuffer_SetCurrentLength(d->out_buf, 0);
     memset(&out, 0, sizeof out);
-    out.pSample = d->out_sample;               /* NULL if MFT provides */
+    out.pSample = d->out_sample;
     hr = IMFTransform_ProcessOutput(d->xf, 0, 1, &out, &status);
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return 0;
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
@@ -407,7 +379,7 @@ static int recv_frame(H264Dec *d, uint8_t *dst, int frameWidth, int pixelMode)
         ok = set_output_type(d);
         fprintf(stderr, "[h264] stream change -> renegotiate %s (%dx%d stride %d)\n",
                 ok ? "ok" : "FAILED", d->out_w, d->out_h, d->out_stride);
-        return ok ? 0 : -1;                        /* renegotiated; retry */
+        return ok ? 0 : -1;
     }
     if (FAILED(hr) || !out.pSample) {
         fprintf(stderr, "[h264] ProcessOutput hr=0x%08lx sample=%p status=%lu\n",
@@ -433,7 +405,7 @@ static int recv_frame(H264Dec *d, uint8_t *dst, int frameWidth, int pixelMode)
             }
             IMFMediaBuffer_Release(mb);
         }
-        if (out.pSample != d->out_sample)      /* MFT-allocated: release */
+        if (out.pSample != d->out_sample)
             IMFSample_Release(out.pSample);
     }
     if (out.pEvents) IMFCollection_Release(out.pEvents);
@@ -463,9 +435,9 @@ int h264_frame(H264Dec *d, int eos, uint8_t *dst, int frameWidth,
             r = send_au(d, d->es + s, e - s);
             if (r < 0) { d->failed = 1; return -1; }
             if (r == 0)
-                d->es_pos = s;             /* decoder full: re-queue */
+                d->es_pos = s;
             else
-                es_compact(d);     /* only after s/e are dead: it shifts es */
+                es_compact(d);
             continue;
         }
         if (eos && !d->drained) {
@@ -479,7 +451,7 @@ int h264_frame(H264Dec *d, int eos, uint8_t *dst, int frameWidth,
     return 0;
 }
 
-#else /* !_WIN32 */
+#else
 
 H264Dec *h264_create(void) { return NULL; }
 void h264_destroy(H264Dec *d) { (void)d; }

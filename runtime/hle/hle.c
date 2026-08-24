@@ -1,7 +1,3 @@
-/* runtime/hle/hle.c -- stub-address -> handler binding and the trap floor.
- * An unimplemented HLE call must abort loudly and name itself, never stub
- * silently. */
-
 #include "hle.h"
 #include "stubs.h"
 #include "threadman.h"
@@ -11,22 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-static HleFn  *g_bound;        /* parallel to g_hle_stubs */
+static HleFn  *g_bound;
 static unsigned g_missing;
 
-/* PSPRECO_QUIET=1 silences the HLE call log.
- *
- * It is not cosmetic. main.c makes stdout unbuffered (so a trap that ends in
- * abort() does not lose its last lines), and this log runs at roughly two
- * writes per GE list -- around 500 a second in a menu and more in a mission.
- * Unbuffered writes to a Windows CONSOLE are not like writes to a file: each
- * one is a syscall that conhost has to render and scroll. Redirect them to a
- * file and they cost nothing, which is exactly why play-debug.bat (which
- * redirects) measured FASTER than play.bat (which does not) -- the extra work
- * play-debug.bat does was dwarfed by the console it was avoiding.
- *
- * So play.bat sets this and gets no per-call log at all. Anything that
- * redirects to a file leaves it alone and keeps the full trace. */
 static int trace_on(void)
 {
     static int on = -1;
@@ -37,7 +20,7 @@ static int trace_on(void)
     return on;
 }
 
-static int g_trace_override = -1;      /* hle_set_trace() wins when used */
+static int g_trace_override = -1;
 
 void hle_set_trace(int on) { g_trace_override = on ? 1 : 0; }
 int  hle_trace_enabled(void)

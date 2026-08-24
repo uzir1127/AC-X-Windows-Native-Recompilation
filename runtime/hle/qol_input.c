@@ -1,91 +1,3 @@
-/* qol_input.c -- a right stick, analog rudder, and R3 to change view.
- *
- * None of this is a rebind.  The engine already contains the code for all
- * three; it was simply never reachable on hardware that had one stick, no
- * trigger travel and no stick clicks.  What follows drives that existing code
- * with the inputs a modern pad actually has, so the behaviour, the ranges,
- * the smoothing and the per-view limits are the game's own.
- *
- * WHERE IT ATTACHES, AND WHY THERE
- * --------------------------------
- * recomp_lookup only sees INDIRECT calls.  A direct call in the recompiled C
- * is a direct C call and cannot be intercepted, so an override is only
- * possible at a function the engine reaches through a table.  Checked in IDA:
- *
- *   sub_62DA0  camera message handler   0 code xrefs, 2 data  -> hookable
- *   sub_79DD8  action 9  (yaw left)     0 code xrefs, 1 data  -> hookable
- *   sub_79EC0  action 10 (yaw right)    0 code xrefs, 1 data  -> hookable
- *
- *   sub_78C30  input mask builder       called directly from sub_7834C
- *   sub_62C50  per-view update          called directly from sub_62DA0
- *   sub_1D4008 pad sampler              called directly from sub_C24
- *
- * The first three are enough for all three features, which is why none of the
- * last three are reimplemented here.  Everything below wraps the original and
- * calls it -- there is no copied engine logic to drift out of sync.
- *
- * 1. CAMERA (sub_62DA0, message 1 = update)
- *
- * The engine has a free-look mode: when the camera's mode byte is 4 it reads
- * the stick, scales it by a per-view maximum angle, and smooths the result
- * into two deltas the view code consumes.  In normal flight the mode is not 4,
- * so that block instead zeroes both deltas -- the plumbing runs every frame
- * and is handed nothing.
- *
- * We let the original run untouched and then write the deltas ourselves from
- * the right stick, reusing its own angle limits and its own smoothing.
- *
- * WHY IT DID NOT WORK ON THE FIRST ATTEMPT, and what actually reads cam+28/+32:
- * not sub_62C50 or its view-0/1/2 tail sub_6272C (that one returns immediately
- * while the mode byte is 0 and never reads either field), and not sub_5EEE0,
- * which only builds the view matrix from the position/target vectors already
- * sitting at entity+8/12.  The real reader is gated on the mode byte itself:
- * sub_61910 (called for every camera from msg 0 and msg 6, never msg 1) picks
- * a per-view handler -- sub_5F2FC (view 0), sub_5FA30 (view 1), sub_60100
- * (view 2) -- and *only their mode==4 branch* touches cam+28/+32 at all, using
- * them as spherical angles (sub_20B5BC/sub_20B760, i.e. cos/sin) to swing the
- * look target (views 0/1) or the eye (view 2) around at the camera's current
- * distance (cam+36).  Every other mode byte ignores both fields outright.
- *
- * Mode 4 is set exactly once in the whole engine, in sub_6272C, gated on
- * dword_287BDC bit 25 -- the free-look button this hardware never had.  So the
- * deltas were being computed and stored correctly; they were simply never
- * read, because nothing had ever asked for mode 4.  Writing cam+28/+32 was
- * necessary but not sufficient -- cam+24 (CAM_MODE) has to be forced to 4 too,
- * for exactly as long as the look is active, which is what camera_after()
- * does below.  sub_6272C resets the byte to 1 on its very next pass (it forces
- * mode to 1 unconditionally the instant it sees any nonzero value, before
- * checking the bit-25 gate), but that pass runs inside the msg==1 call to the
- * *original* handler, which happens before our override in ov_camera -- so we
- * simply re-assert 4 afterwards, every frame the look is held.  Releasing the
- * stick just stops re-asserting it; the engine's own default processing then
- * settles the mode back to 1 on its own.
- *
- * 2. RUDDER (sub_79DD8 / sub_79EC0, actions 9 and 10)
- *
- * Yaw is a single float at flight+180, range [-1,+1].  The two handlers ramp
- * it digitally: 0.05 per frame toward the edge while held, 0.1 per frame back
- * to centre when released, so a full boot takes 20 frames.  With a trigger
- * deflected we write the float directly and the aircraft yaws by as much as
- * the trigger is pressed; with the triggers idle the original runs and the
- * bumpers and keyboard behave exactly as they always did.
- *
- * 3. VIEW (R3 -> sub_7A528, action 16)
- *
- * The engine already cycles view 0 -> 1 -> 2 -> 0, with the wide chase views
- * at 0 and 2 and the restricted cockpit at 1, and does the surrounding
- * bookkeeping (transition style, the two control-suppression flags) that a
- * bare view assignment would skip.  It is action 16 in the handler table and
- * needs the same (player, flight) pair the yaw handlers are given.
- *
- * So R3 is serviced from inside the yaw override.  That is not a hack for
- * want of a better site: sub_7834C runs a release pass over actions 8..16
- * every frame, calling each handler that did not fire with a zero flag, so
- * actions 9 and 10 are guaranteed to be dispatched once per frame whatever
- * the player is doing and whatever the control config maps where.  It is a
- * reliable per-frame hook that arrives holding precisely the two arguments
- * the view cycle wants.
- */
 #include "pspreco.h"
 #include "qol_input.h"
 #include "../host/present.h"
@@ -94,41 +6,36 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Guest addresses.  IDA + 0x08804000; see scratchpad/input-notes.md. */
-#define G_CAMERA_MSG  0x08866DA0u   /* sub_62DA0  camera message handler   */
-#define G_YAW_L       0x0887DDD8u   /* sub_79DD8  action 9,  yaw left      */
-#define G_YAW_R       0x0887DEC0u   /* sub_79EC0  action 10, yaw right     */
-#define G_VIEW_CYCLE  0x0887E528u   /* sub_7A528  action 16, cycle view    */
-#define G_CFG         0x08A80AF4u   /* unk_27CAF4 config object            */
+#define G_CAMERA_MSG  0x08866DA0u
+#define G_YAW_L       0x0887DDD8u
+#define G_YAW_R       0x0887DEC0u
+#define G_VIEW_CYCLE  0x0887E528u
+#define G_CFG         0x08A80AF4u
 
-#define CFG_VIEW      322u          /* s8, current view 0..5               */
+#define CFG_VIEW      322u
 
-/* Camera state lives at entity+224 (sub_62DA0 computes exactly that). */
 #define CAM_BASE      224u
-#define CAM_FLAGS      20u          /* u16: bit0 rebuild.  DO NOT WRITE --
-                                     * sub_7834C reads this byte and can zero
-                                     * the rudder off the back of it. */
-#define CAM_MODE       24u          /* u8:  4 == engine free look.  We force
-                                     * this to drive the views' mode==4 branch
-                                     * (sub_5F2FC/5FA30/60100), the only code
-                                     * that ever reads CAM_PITCH/CAM_YAW.     */
-#define CAM_PITCH      28u          /* f32: smoothed pitch delta           */
-#define CAM_YAW        32u          /* f32: smoothed yaw delta             */
+#define CAM_FLAGS      20u
+#define CAM_MODE       24u
+#define CAM_PITCH      28u
+#define CAM_YAW        32u
 
+#define CAM_MODE_FREE_LOOK 4u
 
-/* The engine's own limits, from the free-look block in sub_62DA0.  Radians of
- * travel at full deflection; the sign is the engine's. */
-#define LOOK_YAW_WIDE   (-2.9670596f)   /* 170 deg, chase views     */
-#define LOOK_YAW_TIGHT  (-1.3962634f)   /*  80 deg, cockpit         */
-#define LOOK_PITCH      (-1.5533431f)   /*  89 deg                  */
+#define VIEW_COCKPIT       1
+#define VIEW_PLAYABLE_END  3
+
+#define LOOK_YAW_WIDE   (-2.9670596f)
+#define LOOK_YAW_TIGHT  (-1.3962634f)
+#define LOOK_PITCH      (-1.5533431f)
+
+#define LOOK_SMOOTHING_DIVISOR 4.0f
+#define LOOK_SETTLED_EPSILON   1.0e-4f
+
+#define VIEW_CYCLE_TRIGGER 1
 
 QolCfg g_qol = { 1, 0, 100, 1, 1 };
 
-/* The F4 menu and pspreco.toml own these settings; gfx_settings_touch() in
- * settings.c pushes them into g_qol, which is the one place every change goes
- * through.  This is the escape hatch on top of that -- one switch turns the
- * lot off without touching a config file, matching SR_GPU_SERIAL and friends.
- * Re-applied after every push, so it wins over the menu. */
 void qol_input_init(void)
 {
     static int off = -1;
@@ -138,11 +45,6 @@ void qol_input_init(void)
     g_qol.rstick_sens = 100;
 }
 
-/* ---- calling back into the guest ---------------------------------------- */
-
-/* Same shape as libmpeg.c's call_guest3: run a guest function as a nested
- * call on the caller's own stack, which is what hardware would do.  Keeping
- * sp/fp/gp is load-bearing -- a scratch stack was tried once and was wrong. */
 static u32 call_guest3(CpuCtx *c, u8 *ram, u32 fn, u32 a0, u32 a1, u32 a2)
 {
     RecompFn f = recomp_lookup(fn);
@@ -160,12 +62,6 @@ static u32 call_guest3(CpuCtx *c, u8 *ram, u32 fn, u32 a0, u32 a1, u32 a2)
     return ret;
 }
 
-/* ---- 3. R3 cycles the view ---------------------------------------------- */
-
-/* Fired from whichever yaw handler runs first this frame.  Latching on the
- * edge is what keeps it to once per press: both handlers are dispatched every
- * frame, so the flag is set before the call and the second one finds it
- * already set.  R3 only changes between host polls, i.e. once a frame. */
 static int s_r3_held;
 
 static void qol_view_cycle(CpuCtx *c, u8 *ram, u32 player, u32 flight)
@@ -176,45 +72,20 @@ static void qol_view_cycle(CpuCtx *c, u8 *ram, u32 player, u32 flight)
     if (!down) { s_r3_held = 0; return; }
     if (s_r3_held) return;
     s_r3_held = 1;
-    /* a3 != 0 is the trigger; sub_7A528 returns immediately without it. */
-    call_guest3(c, ram, G_VIEW_CYCLE, player, flight, 1);
+    call_guest3(c, ram, G_VIEW_CYCLE, player, flight, VIEW_CYCLE_TRIGGER);
 }
-
-/* ---- 2. analog rudder --------------------------------------------------- */
-
 
 static void yaw_common(CpuCtx *c, u8 *ram, RecompFn orig)
 {
     u32 player = c->r[R_A0];
     u32 flight = c->r[R_A1];
 
-    /* We do NOT touch flight+180 any more.  It was identified as the rudder
-     * from its shape alone -- a float in [-1,+1] that the two handlers ramp at
-     * 0.05 per frame and recentre at 0.1 -- and that was wrong.  It is the
-     * BRAKE/THRUST axis: negative brakes, positive is thrust, and the ramp is
-     * an engine spooling up rather than a rudder deflecting.  Actions 9 and 10
-     * are what the L and R buttons drive in this game.
-     *
-     * The tell is that none of the other handlers in off_24F9B4 write a float
-     * at all -- 11..15 set command bits in flight+17 (weapon, fire, autopilot)
-     * and 8 suppresses the flight controls after fifteen held frames.  A lone
-     * analog axis in a table of bit-setters should have been read as the one
-     * thing the aircraft has that is analog besides the stick: the throttle.
-     *
-     * So this override now only passes through, and exists for the R3 hook
-     * below.  Where the rudder actually lives is not yet established. */
     (void)player;
     (void)flight;
     if (orig) orig(c, ram);
 
-    /* R3 is serviced from here because sub_7834C dispatches actions 8..16
-     * every frame in its release pass, whatever the player does and whatever
-     * the control config maps where -- and the arguments arriving here are
-     * exactly the (player, flight) pair the view cycle needs. */
     qol_view_cycle(c, ram, player, flight);
 }
-
-/* ---- 1. right stick moves the camera ------------------------------------ */
 
 static float stick_axis(u8 raw)
 {
@@ -224,15 +95,6 @@ static float stick_axis(u8 raw)
     return v;
 }
 
-/* Smoothing state, held here rather than in the guest fields.
- *
- * It has to be.  The handler we run after zeroes cam+28 and cam+32 on every
- * frame that free look is off, which is every frame of normal flight -- so
- * reading the previous value back out of guest memory always yields zero, and
- * a quarter-of-the-remaining-distance step from zero would leave the camera
- * permanently at a quarter deflection instead of easing to full.  Keeping the
- * accumulator on this side reproduces what the engine does with its own
- * persistent copy in free-look mode. */
 static float s_look_yaw, s_look_pitch;
 static int   s_look_view = -1;
 
@@ -249,15 +111,11 @@ static void camera_after(u8 *ram, u32 entity)
     u8 rx = 128, ry = 128;
     float ax, ay, yaw, pitch, sens;
 
-    /* Views 3..5 are the scripted and replay cameras; they own the frame and
-     * are not ours to nudge.  Mode 4 is the engine's own free look, already
-     * driving these same fields from the left stick -- leave it alone. */
-    if (view < 0 || view >= 3 || mem_r8(ram, cam + CAM_MODE) == 4u) {
+    if (view < 0 || view >= VIEW_PLAYABLE_END
+        || mem_r8(ram, cam + CAM_MODE) == CAM_MODE_FREE_LOOK) {
         look_reset();
         return;
     }
-    /* A view change is a cut, not a pan: start the new one centred rather
-     * than sliding in from wherever the old one was pointing. */
     if (view != s_look_view) {
         s_look_yaw = s_look_pitch = 0.0f;
         s_look_view = view;
@@ -266,25 +124,19 @@ static void camera_after(u8 *ram, u32 entity)
     present_analog2(&rx, &ry);
     ax = stick_axis(rx);
     ay = stick_axis(ry);
-    if (!g_qol.rstick_invert) ay = -ay;   /* engine divides by -127 */
+    if (!g_qol.rstick_invert) ay = -ay;
 
     sens = (float)g_qol.rstick_sens / 100.0f;
-    yaw   = ax * (view == 1 ? LOOK_YAW_TIGHT : LOOK_YAW_WIDE) * sens;
+    yaw   = ax * (view == VIEW_COCKPIT ? LOOK_YAW_TIGHT : LOOK_YAW_WIDE) * sens;
     pitch = ay * LOOK_PITCH * sens;
-    /* The cockpit view never looks above the horizon.  Same guard as the
-     * engine's, applied to the same sign of the same field. */
-    if (view == 1 && pitch < 0.0f) pitch = 0.0f;
+    if (view == VIEW_COCKPIT && pitch < 0.0f) pitch = 0.0f;
 
-    /* The engine's smoothing: a quarter of the remaining distance per frame. */
-    s_look_pitch += (pitch - s_look_pitch) / 4.0f;
-    s_look_yaw   += (yaw   - s_look_yaw)   / 4.0f;
+    s_look_pitch += (pitch - s_look_pitch) / LOOK_SMOOTHING_DIVISOR;
+    s_look_yaw   += (yaw   - s_look_yaw)   / LOOK_SMOOTHING_DIVISOR;
 
-    /* Nothing being asked for and nothing left to settle: leave the frame
-     * exactly as the engine wrote it.  A player who never touches the right
-     * stick should not be able to tell this code is compiled in.  The
-     * threshold is a thousandth of a degree, well under a pixel of pan. */
     if (ax == 0.0f && ay == 0.0f
-        && fabsf(s_look_yaw) < 1.0e-4f && fabsf(s_look_pitch) < 1.0e-4f) {
+        && fabsf(s_look_yaw) < LOOK_SETTLED_EPSILON
+        && fabsf(s_look_pitch) < LOOK_SETTLED_EPSILON) {
         s_look_yaw = s_look_pitch = 0.0f;
         return;
     }
@@ -292,34 +144,21 @@ static void camera_after(u8 *ram, u32 entity)
     mem_wf32(ram, cam + CAM_PITCH, s_look_pitch);
     mem_wf32(ram, cam + CAM_YAW,   s_look_yaw);
 
-    /* The write that was missing on the first attempt.  sub_5F2FC/5FA30/60100
-     * only read CAM_PITCH/CAM_YAW from their mode==4 branch, and mode is never
-     * 4 in normal play (see the file header) -- so without this the deltas
-     * above were computed and stored correctly and then never looked at.
-     * sub_6272C claws this back to 1 on its very next pass, once per frame,
-     * but that pass is inside the original handler and runs before we get
-     * here, so re-asserting 4 every frame the look is held is sufficient. */
-    mem_w8(ram, cam + CAM_MODE, 4u);
-
-    /* Setting flag bit 2 here was wrong and actively harmful.  sub_7834C
-     * inspects this same byte in its tail and, on one branch, zeroes the
-     * rudder at flight+180 along with pitch, roll and flight+256 -- so
-     * touching it to enable a look that was never gated on it took the
-     * analog rudder out with it.  Left alone. */
+    mem_w8(ram, cam + CAM_MODE, CAM_MODE_FREE_LOOK);
 }
 
-/* ---- the override table ------------------------------------------------- */
-
 static RecompFn s_orig_cam, s_orig_yaw_l, s_orig_yaw_r;
+
+#define CAMERA_MSG_UPDATE 1u
 
 static void ov_camera(CpuCtx *c, u8 *ram)
 {
     u32 entity = c->r[R_A0];
     u32 msg    = c->r[R_A1] & 0xFFu;
-    if (s_orig_cam) s_orig_cam(c, ram);   /* may clobber a0/a1, hence above */
-    if (msg != 1u || !entity) return;
+    if (s_orig_cam) s_orig_cam(c, ram);
+    if (msg != CAMERA_MSG_UPDATE || !entity) return;
     if (g_qol.rstick_cam) camera_after(ram, entity);
-    else                  look_reset();   /* so switching it back on recentres */
+    else                  look_reset();
 }
 
 static void ov_yaw_l(CpuCtx *c, u8 *ram) { yaw_common(c, ram, s_orig_yaw_l); }
@@ -332,7 +171,7 @@ RecompFn qol_override(u32 addr, RecompFn orig)
     case G_CAMERA_MSG: s_orig_cam   = orig; ov = ov_camera; break;
     case G_YAW_L:      s_orig_yaw_l = orig; ov = ov_yaw_l;  break;
     case G_YAW_R:      s_orig_yaw_r = orig; ov = ov_yaw_r;  break;
-    default:           return NULL;   /* the overwhelmingly common case */
+    default:           return NULL;
     }
     qol_input_init();
     return ov;

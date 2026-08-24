@@ -1,5 +1,3 @@
-/* runtime/host/main.c -- host harness: load the relocated image, enter it. */
-
 #include "pspreco.h"
 #include "../../generated/symbols.h"
 #include "../hle/hle.h"
@@ -24,8 +22,13 @@
 extern u8 *g_ram;
 
 #if defined(_WIN32)
-/* Last-words crash handler: a hard fault otherwise kills the process with an
- * empty log. Reports where relative to the module and the guest arena. */
+#define EXC_ACCESS_VIOLATION      0xC0000005u
+#define EXC_STACK_OVERFLOW        0xC00000FDu
+#define EXC_ILLEGAL_INSTRUCTION   0xC000001Du
+#define EXC_ARRAY_BOUNDS_EXCEEDED 0xC000008Cu
+#define EXC_HEAP_CORRUPTION       0xC0000374u
+#define EXC_FAIL_FAST             0xC0000409u
+
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep)
 {
     void *addr = ep->ExceptionRecord->ExceptionAddress;
@@ -45,14 +48,8 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* First-chance vectored reporter. The UEF above never fires for two fatal
- * classes: stack overflow (the filter's own fprintf needs stack and
- * double-faults) and fail-fast/heap-corruption terminations (which skip
- * exception dispatch entirely -- those only show in the exit code). This
- * handler runs before any frame-based handling, uses a fixed small stack
- * footprint and no CRT so it can speak even on EXCEPTION_STACK_OVERFLOW.
- * First-chance means a line here may be for an exception something later
- * handles; capped at 8 lines. */
+#define VH_MAX_REPORTED_EXCEPTIONS 8
+
 static void vh_put_hex(char **pp, ULONG_PTR v, int digits)
 {
     static const char h[] = "0123456789abcdef";
@@ -73,17 +70,17 @@ static LONG CALLBACK vh_first_chance(EXCEPTION_POINTERS *ep)
     DWORD wr;
 
     switch (code) {
-    case 0xC0000005u:   /* access violation */
-    case 0xC00000FDu:   /* stack overflow */
-    case 0xC000001Du:   /* illegal instruction */
-    case 0xC000008Cu:   /* array bounds exceeded */
-    case 0xC0000374u:   /* heap corruption */
-    case 0xC0000409u:   /* fail-fast / GS cookie */
+    case EXC_ACCESS_VIOLATION:
+    case EXC_STACK_OVERFLOW:
+    case EXC_ILLEGAL_INSTRUCTION:
+    case EXC_ARRAY_BOUNDS_EXCEEDED:
+    case EXC_HEAP_CORRUPTION:
+    case EXC_FAIL_FAST:
         break;
     default:
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (InterlockedIncrement(&count) > 8)
+    if (InterlockedIncrement(&count) > VH_MAX_REPORTED_EXCEPTIONS)
         return EXCEPTION_CONTINUE_SEARCH;
     base = (ULONG_PTR)GetModuleHandleW(NULL);
     memcpy(p, "[pspreco] EXC code=", 19); p += 19;
@@ -92,7 +89,7 @@ static LONG CALLBACK vh_first_chance(EXCEPTION_POINTERS *ep)
     vh_put_hex(&p, addr - base, 12);
     memcpy(p, " tid=", 5); p += 5;
     vh_put_hex(&p, GetCurrentThreadId(), 6);
-    if (code == 0xC0000005u && ep->ExceptionRecord->NumberParameters >= 2) {
+    if (code == EXC_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
         memcpy(p, " acc=", 5); p += 5;
         vh_put_hex(&p, ep->ExceptionRecord->ExceptionInformation[1], 12);
     }
@@ -103,8 +100,6 @@ static LONG CALLBACK vh_first_chance(EXCEPTION_POINTERS *ep)
 }
 #endif
 
-/* Watchdog: a guest busy-wait never yields under the cooperative scheduler,
- * so a host thread bounds the hang. PSPRECO_WATCHDOG_S raises/disables (0). */
 #define WATCHDOG_DEFAULT_SECONDS 20
 
 static unsigned g_watchdog_seconds = WATCHDOG_DEFAULT_SECONDS;
@@ -163,25 +158,17 @@ static void watchdog_start(void)
 #endif
 }
 
-/* 0x00269200 is the RELOCATED gp for acepsp (the unrelocated 0x0001B380
- * would point into .text). ACEPSP_LOAD_BASE must equal prxload.py's
- * PSP_USER_MODULE_BASE, which is what --emit-image relocates to. */
 #define ACEPSP_LOAD_BASE 0x08804000u
 #define ACEPSP_ENTRY    (ACEPSP_LOAD_BASE + 0x00000128u)
 #define ACEPSP_GP       (ACEPSP_LOAD_BASE + 0x00269200u)
-/* Sibling thread stacks grow down from here, below the primary stack the
- * kernel puts just under 0x0A000000. */
 #define GUEST_STACK_TOP 0x09F00000u
 
-/* The kernel's hand-off state, from the oracle trace's init dump. */
 #define BOOT_SP         0x09FFFE90u
-#define BOOT_RA         0x08000030u   /* back into the kernel's loader */
-#define BOOT_K0         0x09FFFF00u   /* primary thread's control region */
+#define BOOT_RA         0x08000030u
+#define BOOT_K0         0x09FFFF00u
 #define BOOT_ARGP_ADDR  0x09FFFED0u
 #define BOOT_ARGP       "disc0:/PSP_GAME/SYSDIR/EBOOT.BIN"
-/* BOOT_FCR31 lives in pspreco.h -- threadman.c needs the same value. */
 
-/* Guest RAM window; non-static so ge_gpu_vk.c can read guest VRAM. */
 u8 *g_ram;
 
 int main(int argc, char **argv)
@@ -195,16 +182,11 @@ int main(int argc, char **argv)
     CpuCtx ctx;
     RecompFn entry;
 
-    /* Traps end in abort(), which does not flush stdio; unbuffer both. */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    /* Graphics settings before anything opens a window or a renderer. */
     gfx_settings_load();
 
-    /* Stamp the build and the settings that change how the game behaves. A
-     * tester's log otherwise cannot be told apart from any other build's, and
-     * guessing which one they ran has already cost a round trip. */
     printf("[pspreco] build %s %s (60 FPS patch in), settings %s: "
            "res_scale=%d frameskip=%d speed=%d%%\n",
            __DATE__, __TIME__, gfx_settings_path(),
@@ -217,7 +199,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Self-tests need only guest RAM -- no image, no disc. */
     if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
         return ge_raster_selftest(g_ram) ? 1 : 0;
 
@@ -269,23 +250,15 @@ int main(int argc, char **argv)
     present_init("pspreco -- Ace Combat X");
     cpu_set_host_fpu_mode();
     ge_raster_init();
-    /* Windowed: rasterise on the Vulkan device; headless or PSPRECO_GPU=0
-     * stays on the software rasteriser. */
     present_gpu_init();
     hle_init();
-    /* User partition starts above the module; image.bin includes .bss. */
     sysmem_set_partition_begin(ACEPSP_LOAD_BASE + (u32)sz);
-    /* module_start state from the PPSSPP oracle init dump
-     * (build/oracle/acx/o.trace line 2):
-     *   a0 = 33, a1 = 0x09FFFED0, sp = 0x09FFFE90, ra = 0x08000030,
-     *   k0 = 0x09FFFF00, gp = 0x08A6D200, fcr31 = 0x00000E00.
-     * a0/a1 = (argSize, argp): the NUL-terminated load path. */
     memset(&ctx, 0, sizeof ctx);
     ctx.r[R_GP] = ACEPSP_GP;
     ctx.r[R_SP] = BOOT_SP;
     ctx.r[R_RA] = BOOT_RA;
     ctx.r[R_K0] = BOOT_K0;
-    ctx.r[R_A0] = (u32)sizeof BOOT_ARGP;      /* includes the NUL */
+    ctx.r[R_A0] = (u32)sizeof BOOT_ARGP;
     ctx.r[R_A1] = BOOT_ARGP_ADDR;
     memcpy(g_ram + BOOT_ARGP_ADDR, BOOT_ARGP, sizeof BOOT_ARGP);
     ctx.fcr31 = BOOT_FCR31;
@@ -304,8 +277,6 @@ int main(int argc, char **argv)
     printf("[pspreco] module_start returned %d; entering scheduler\n",
            (int)ctx.r[R_V0]);
 
-    /* module_start only starts the initial thread; the rest runs under the
-     * fiber scheduler. */
     threadman_run();
     printf("[pspreco] scheduler idle after %llu us of emulated time\n",
            (unsigned long long)threadman_now_us());

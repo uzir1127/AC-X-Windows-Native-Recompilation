@@ -1,23 +1,16 @@
-/* runtime/hle/sysmem.c -- SysMemUserForUser HLE.
- *
- * sceKernelAllocPartitionMemory (237DBD4F), sceKernelFreePartitionMemory
- * (B6D61D02) and sceKernelGetBlockHeadAddr (9D9A5BA1) are absent from SDK
- * 6.6.0 headers; their argument shapes come from the game's call sites, and
- * the SCE_KERNEL_SMEM_* placement constants they take are the firmware's.
- */
-
 #include "hle.h"
 #include "sce_errors.h"
 
 #include <stdio.h>
 #include <string.h>
 
-/* --- the user partition ------------------------------------------------ */
-/* Starts page-aligned just above the loaded module: main() computes it and
- * calls sysmem_set_partition_begin(); the constant is only the fallback.
- * The top, 0x09FFFF00, is 0x100 below the end of 32 MB of user RAM
- * (PSP-2000 model), matching where a real boot puts the first SMEM_High
- * allocation; lower it to model a 24 MB PSP-1000. */
+#define SCE_KERNEL_SMEM_Low          0
+#define SCE_KERNEL_SMEM_High         1
+#define SCE_KERNEL_SMEM_Addr         2
+#define SCE_KERNEL_SMEM_HighAligned  4
+
+#define SCE_KERNEL_PRIMARY_USER_PARTITION 2u
+
 #define USER_PARTITION_END   0x09FFFF00u
 #define PARTITION_PAGE       0x1000u
 #define BLOCK_ALIGN          256u
@@ -45,7 +38,6 @@ static int      g_next_uid = 0x1000;
 
 static u32 align_up(u32 v, u32 a) { return (v + a - 1u) & ~(a - 1u); }
 
-/* First/last fit over the free space between existing blocks. */
 static int alloc_block(const char *name, int type, u32 size, u32 want_addr,
                        u32 *out_addr)
 {
@@ -60,12 +52,10 @@ static int alloc_block(const char *name, int type, u32 size, u32 want_addr,
         if (!g_blocks[i].used) { slot = i; break; }
     if (slot < 0) return -1;
 
-    if (type == 2 /* SCE_KERNEL_SMEM_Addr */) {
+    if (type == SCE_KERNEL_SMEM_Addr) {
         chosen = align_up(want_addr, BLOCK_ALIGN);
-    } else if (type == 1 /* SCE_KERNEL_SMEM_High */
-               || type == 4 /* HighAligned */) {
-        /* Highest free run that fits: start at the top and slide down past
-         * collisions (the low-placed heap sits at the partition bottom). */
+    } else if (type == SCE_KERNEL_SMEM_High
+               || type == SCE_KERNEL_SMEM_HighAligned) {
         u32 base = (hi - size) & ~(BLOCK_ALIGN - 1u);
         int moved = 1;
         while (moved) {
@@ -82,7 +72,7 @@ static int alloc_block(const char *name, int type, u32 size, u32 want_addr,
         }
         if (base < lo) return -1;
         chosen = base;
-    } else {                 /* Low / LowAligned */
+    } else {
         u32 base = lo;
         int moved = 1;
         while (moved) {
@@ -130,13 +120,10 @@ static u32 total_free(void)
     return (USER_PARTITION_END - USER_PARTITION_BEGIN) - used;
 }
 
-/* --- exported state ---------------------------------------------------- */
 static u32 g_compiled_sdk_version;
 static u32 g_compiler_version;
 
 u32 sysmem_compiled_sdk_version(void) { return g_compiled_sdk_version; }
-
-/* --- handlers ---------------------------------------------------------- */
 
 void hle_sceKernelSetCompiledSdkVersion(CpuCtx *c, u8 *ram)
 {
@@ -169,16 +156,12 @@ void hle_sceKernelMaxFreeMemSize(CpuCtx *c, u8 *ram)
     HLE_RET(total_free());
 }
 
-/* Logs the format string only; guest varargs are not interpreted. */
 void hle_sceKernelPrintf(CpuCtx *c, u8 *ram)
 {
     hle_log("[game] %s", hle_cstr(ram, HLE_A0));
     HLE_RET(0);
 }
 
-/* Not in SDK headers (see file header).
- * SceUID sceKernelAllocPartitionMemory(SceUID partition, const char *name,
- *                                      int type, SceSize size, void *addr) */
 void hle_sceKernelAllocPartitionMemory(CpuCtx *c, u8 *ram)
 {
     u32 partition = HLE_A0;
@@ -189,7 +172,7 @@ void hle_sceKernelAllocPartitionMemory(CpuCtx *c, u8 *ram)
     u32 addr = 0;
     int uid;
 
-    if (partition != 2u /* SCE_KERNEL_PRIMARY_USER_PARTITION */) {
+    if (partition != SCE_KERNEL_PRIMARY_USER_PARTITION) {
         hle_log("[hle] sceKernelAllocPartitionMemory: partition %u refused",
                 partition);
         HLE_RET(SCE_KERNEL_ERROR_ILLEGAL_PARTITION);
@@ -208,7 +191,6 @@ void hle_sceKernelAllocPartitionMemory(CpuCtx *c, u8 *ram)
     HLE_RET(uid);
 }
 
-/* Not in SDK headers. int sceKernelFreePartitionMemory(SceUID blockid) */
 void hle_sceKernelFreePartitionMemory(CpuCtx *c, u8 *ram)
 {
     MemBlock *b = find_block((int)HLE_A0);
@@ -223,7 +205,6 @@ void hle_sceKernelFreePartitionMemory(CpuCtx *c, u8 *ram)
     HLE_RET(0);
 }
 
-/* Not in SDK headers. void *sceKernelGetBlockHeadAddr(SceUID blockid) */
 void hle_sceKernelGetBlockHeadAddr(CpuCtx *c, u8 *ram)
 {
     MemBlock *b = find_block((int)HLE_A0);
@@ -237,26 +218,20 @@ void hle_sceKernelGetBlockHeadAddr(CpuCtx *c, u8 *ram)
     HLE_RET(b->addr);
 }
 
-/* Runtime-internal allocation; shares the guest allocator's bookkeeping so
- * sceKernelTotalFreeMemSize stays honest. */
 u32 sysmem_alloc_raw(const char *name, u32 size)
 {
     u32 addr = 0;
-    int uid = alloc_block(name, 0 /* SCE_KERNEL_SMEM_Low */, size, 0, &addr);
+    int uid = alloc_block(name, SCE_KERNEL_SMEM_Low, size, 0, &addr);
     return (uid < 0) ? 0u : addr;
 }
 
-/* Thread stacks come off the top of the partition, as on a real kernel. */
 u32 sysmem_alloc_high(const char *name, u32 size)
 {
     u32 addr = 0;
-    int uid = alloc_block(name, 1 /* SCE_KERNEL_SMEM_High */, size, 0, &addr);
+    int uid = alloc_block(name, SCE_KERNEL_SMEM_High, size, 0, &addr);
     return (uid < 0) ? 0u : addr;
 }
 
-/* By address, because the block uid never leaves sysmem for these: thread
- * stacks are allocated by threadman, which only ever knows where they are.
- * Without this every deleted thread's stack stayed allocated for the run. */
 int sysmem_free_at(u32 addr)
 {
     int i;

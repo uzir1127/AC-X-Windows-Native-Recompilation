@@ -1,5 +1,3 @@
-/* runtime/host/present_null.c -- headless presenter (the default build). */
-
 #include "present.h"
 
 int present_init(const char *title)
@@ -18,7 +16,6 @@ u32 present_buttons(void) { return 0u; }
 
 void present_analog(u8 *lx, u8 *ly)
 {
-    /* ctrlsvc.h:116-119: the analog axes are 0..255 with 128 at centre. */
     if (lx) *lx = 128u;
     if (ly) *ly = 128u;
 }

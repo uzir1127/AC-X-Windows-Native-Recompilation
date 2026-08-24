@@ -1,7 +1,3 @@
-/* runtime/host/audio_out.c -- winmm waveOut sink. See audio_out.h.
- * Short device queue (4 x 1024 frames ~ 93 ms) keeps voice near subtitles;
- * the feeder emits silence when starved, so the device never stalls. */
-
 #include "audio_out.h"
 
 #include <stdio.h>
@@ -16,14 +12,14 @@
 
 #define AO_RATE       44100
 #define AO_CHANNELS   8
-#define RING_FRAMES   65536              /* ~1.49 s; power of two */
-#define BLOCK_FRAMES  1024               /* one waveOut buffer */
+#define RING_FRAMES   65536
+#define BLOCK_FRAMES  1024
 #define NUM_BLOCKS    4
 
 static int32_t  s_accL[RING_FRAMES];
 static int32_t  s_accR[RING_FRAMES];
-static uint32_t s_play;                  /* feeder read cursor (frames) */
-static uint32_t s_chw[AO_CHANNELS];      /* per-channel write cursors */
+static uint32_t s_play;
+static uint32_t s_chw[AO_CHANNELS];
 
 static HWAVEOUT s_dev;
 static HANDLE   s_event;
@@ -32,7 +28,8 @@ static WAVEHDR  s_hdr[NUM_BLOCKS];
 static int16_t  s_pcm[NUM_BLOCKS][BLOCK_FRAMES * 2];
 static CRITICAL_SECTION s_lock;
 static volatile int s_run;
-static int s_state;                      /* 0 = untried, 1 = ok, -1 = failed */
+enum { AO_UNTRIED = 0, AO_OPEN = 1, AO_FAILED = -1 };
+static int s_state;
 
 static int16_t clamp16(int32_t v)
 {
@@ -72,8 +69,8 @@ static int ao_init(void)
     WAVEFORMATEX wf;
     int b;
 
-    if (s_state) return s_state > 0;
-    s_state = -1;
+    if (s_state != AO_UNTRIED) return s_state == AO_OPEN;
+    s_state = AO_FAILED;
     {
         const char *e = getenv("PSPRECO_NOAUDIO");
         if (e && e[0] && e[0] != '0') return 0;
@@ -101,7 +98,7 @@ static int ao_init(void)
         s_hdr[b].lpData = (LPSTR)s_pcm[b];
         s_hdr[b].dwBufferLength = BLOCK_FRAMES * 4;
         waveOutPrepareHeader(s_dev, &s_hdr[b], sizeof s_hdr[b]);
-        s_hdr[b].dwFlags |= WHDR_DONE;   /* all blocks start available */
+        s_hdr[b].dwFlags |= WHDR_DONE;
     }
     s_run = 1;
     s_thread = CreateThread(NULL, 0, feeder, NULL, 0, NULL);
@@ -113,7 +110,7 @@ static int ao_init(void)
     }
     printf("[audio] waveOut open: %d Hz stereo s16, %d x %d-frame blocks\n",
            AO_RATE, NUM_BLOCKS, BLOCK_FRAMES);
-    s_state = 1;
+    s_state = AO_OPEN;
     return 1;
 }
 
@@ -127,7 +124,6 @@ void audio_out_push(int ch, const int16_t *lr, int nframes, int volL, int volR)
 
     EnterCriticalSection(&s_lock);
     w = s_chw[ch];
-    /* Fell behind the playhead: snap forward. Ran a full ring ahead: drop. */
     if ((int32_t)(w - s_play) < 0) w = s_play;
     if (w - s_play > RING_FRAMES - (uint32_t)nframes) {
         LeaveCriticalSection(&s_lock);
@@ -146,7 +142,7 @@ int audio_out_queued(int ch)
 {
     int32_t d;
     if (ch < 0 || ch >= AO_CHANNELS) return -1;
-    if (s_state <= 0) return -1;
+    if (s_state != AO_OPEN) return -1;
     EnterCriticalSection(&s_lock);
     d = (int32_t)(s_chw[ch] - s_play);
     LeaveCriticalSection(&s_lock);
@@ -155,7 +151,7 @@ int audio_out_queued(int ch)
 
 void audio_out_shutdown(void)
 {
-    if (s_state <= 0) return;
+    if (s_state != AO_OPEN) return;
     s_run = 0;
     SetEvent(s_event);
     WaitForSingleObject(s_thread, 1000);
@@ -164,10 +160,10 @@ void audio_out_shutdown(void)
     waveOutClose(s_dev);
     CloseHandle(s_event);
     DeleteCriticalSection(&s_lock);
-    s_state = -1;
+    s_state = AO_FAILED;
 }
 
-#else /* !_WIN32: no host audio; the HLE layer paces open-loop. */
+#else
 
 void audio_out_push(int ch, const int16_t *lr, int nframes, int volL, int volR)
 { (void)ch; (void)lr; (void)nframes; (void)volL; (void)volR; }

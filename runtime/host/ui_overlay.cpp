@@ -1,14 +1,3 @@
-/* runtime/host/ui_overlay.cpp -- the F4 graphics menu.
- *
- * Dear ImGui on the SDL3 + Vulkan backends, drawn into the swapchain image
- * the presenter just blitted the guest frame into. The overlay owns a
- * LOAD/PRESENT_SRC render pass, so it is also what puts the image into its
- * final layout: ui_render() replaces the presenter's closing barrier.
- *
- * Everything here edits g_gfx and nothing else; the renderer reads that
- * struct directly, so there is no apply step and no shadow copy to drift.
- */
-
 #include "ui_overlay.h"
 #include "settings.h"
 
@@ -41,16 +30,13 @@ static uint32_t        s_n_img;
 static VkImageView     s_views[MAX_IMAGES];
 static VkFramebuffer   s_fbs[MAX_IMAGES];
 
-/* rolling frame timing for the readout. s_fps is the presentation rate (one
- * per emulated vblank); s_game_fps is how often the game itself swaps, which
- * is half of it wherever the game still runs at 30. */
 static double   s_fps, s_frame_ms, s_game_fps;
 static uint64_t s_last_ticks;
 static int      s_frames;
 static unsigned s_last_game_frames;
 
 extern "C" unsigned long g_ge_prim_count;
-extern "C" unsigned display_game_frames(void);   /* runtime/hle/display.c */
+extern "C" unsigned display_game_frames(void);
 
 static void destroy_targets(void)
 {
@@ -76,7 +62,6 @@ static bool make_render_pass(VkFormat fmt)
     memset(&att, 0, sizeof att);
     att.format         = fmt;
     att.samples        = VK_SAMPLE_COUNT_1_BIT;
-    /* The frame is already in the image: load it, do not clear it. */
     att.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
     att.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
     att.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -99,12 +84,6 @@ static bool make_render_pass(VkFormat fmt)
     dep.srcStageMask  = VK_PIPELINE_STAGE_TRANSFER_BIT;
     dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     dep.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    /* READ as well as WRITE: initialLayout is TRANSFER_DST and the subpass uses
-     * COLOR_ATTACHMENT, so beginning the pass transitions the image, and
-     * loadOp LOAD then READS it. Without READ in the destination scope that
-     * read is not ordered against the transition -- which is the
-     * "attachment loadOp access is not synchronized with the attachment layout
-     * transition" that synchronization validation reports. */
     dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
                       | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
@@ -132,7 +111,7 @@ int ui_init(const UiVkInfo *vk)
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
-    io.IniFilename = NULL;                  /* no imgui.ini next to the game */
+    io.IniFilename = NULL;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard
                     | ImGuiConfigFlags_NavEnableGamepad;
     ImGui::StyleColorsDark();
@@ -194,7 +173,6 @@ void ui_swapchain(uint32_t format, uint32_t width, uint32_t height,
     }
 
     if (!s_backend_up) {
-        /* Value-initialised, not memset: it holds non-trivial members. */
         ImGui_ImplVulkan_InitInfo ii = {};
         ii.ApiVersion         = VK_API_VERSION_1_0;
         ii.Instance           = s_inst;
@@ -202,7 +180,7 @@ void ui_swapchain(uint32_t format, uint32_t width, uint32_t height,
         ii.Device             = s_dev;
         ii.QueueFamily        = s_qfam;
         ii.Queue              = s_queue;
-        ii.DescriptorPoolSize = 16;      /* backend owns the pool */
+        ii.DescriptorPoolSize = 16;
         ii.MinImageCount      = count < 2 ? 2 : count;
         ii.ImageCount         = count < 2 ? 2 : count;
         ii.PipelineInfoMain.RenderPass  = s_pass;
@@ -235,7 +213,7 @@ void ui_toggle(void)
     if (!s_inited) return;
     s_visible = !s_visible;
     SDL_SetWindowRelativeMouseMode(s_win, false);
-    if (!s_visible) gfx_settings_save();      /* closing the menu persists it */
+    if (!s_visible) gfx_settings_save();
 }
 
 int ui_handle_event(const void *sdl_event)
@@ -244,7 +222,6 @@ int ui_handle_event(const void *sdl_event)
     if (!s_inited || !e) return 0;
     ImGui_ImplSDL3_ProcessEvent(e);
     if (!s_visible) return 0;
-    /* With the menu open the keyboard and mouse belong to it. */
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
     case SDL_EVENT_TEXT_INPUT:
@@ -258,7 +235,6 @@ int ui_handle_event(const void *sdl_event)
 
 void ui_note_frame(double frame_ms) { s_frame_ms = frame_ms; }
 
-/* ---- the menu ------------------------------------------------------------ */
 
 static void combo_int(const char *label, int *v, const char *const *items, int n)
 {
@@ -272,7 +248,6 @@ static void combo_int(const char *label, int *v, const char *const *items, int n
     }
 }
 
-/* game / off / on, as a three-way radio row */
 static void tristate(const char *label, int *v, const char *help)
 {
     static const char *k_names[3] = { "Game", "Off", "Force" };
@@ -590,5 +565,5 @@ int ui_render(void *cmd, uint32_t index)
     vkCmdBeginRenderPass((VkCommandBuffer)cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     ImGui_ImplVulkan_RenderDrawData(dd, (VkCommandBuffer)cmd);
     vkCmdEndRenderPass((VkCommandBuffer)cmd);
-    return 1;                     /* the pass left the image in PRESENT_SRC */
+    return 1;
 }

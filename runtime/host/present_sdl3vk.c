@@ -1,11 +1,3 @@
-/* runtime/host/present_sdl3vk.c -- SDL3 window, Vulkan swapchain, SDL input.
- *
- * Per frame: convert the guest frame buffer to BGRA8 in a persistently-mapped
- * staging buffer, copy to a device image, blit to the swapchain letterboxed.
- * A presenter, not a renderer. One frame in flight (fence after submit) --
- * presentation cost is trivial and it keeps recreation/shutdown simple.
- */
-
 #include "present.h"
 #include "settings.h"
 #include "ui_overlay.h"
@@ -23,6 +15,9 @@
 #define PSP_W 480
 #define PSP_H 272
 
+#define MAX_SWAP_IMAGES 8
+#define FRAMES_IN_FLIGHT 2
+
 static SDL_Window      *s_win;
 static SDL_Gamepad     *s_pad;
 static VkInstance       s_inst;
@@ -32,31 +27,43 @@ static VkDevice         s_dev;
 static uint32_t         s_qfam;
 static VkQueue          s_queue;
 static VkCommandPool    s_pool;
-static VkCommandBuffer  s_cmd;
-static VkFence          s_fence;
-static VkSemaphore      s_sem_acq, s_sem_done;
 static VkDebugUtilsMessengerEXT s_dbg;
 
 static VkSwapchainKHR s_swap;
 static VkFormat       s_swap_fmt;
 static VkExtent2D     s_swap_ext;
 static uint32_t       s_swap_n;
-static VkImage        s_swap_img[8];
+static VkImage        s_swap_img[MAX_SWAP_IMAGES];
 
-static VkBuffer       s_staging;
-static VkDeviceMemory s_staging_mem;
-static void          *s_staging_map;
-static VkImage        s_fbimg;
-static VkDeviceMemory s_fbimg_mem;
+typedef struct {
+    VkCommandBuffer cmd;
+    VkFence         fence;
+    VkSemaphore     acquired;
+    VkBuffer        staging;
+    VkDeviceMemory  staging_mem;
+    void           *staging_map;
+    VkImage         fbimg;
+    VkDeviceMemory  fbimg_mem;
+} PresentSlot;
+
+static PresentSlot s_slot[FRAMES_IN_FLIGHT];
+static VkSemaphore s_sem_done[MAX_SWAP_IMAGES];
+static uint64_t    s_frame_index;
+
+static PresentSlot *slot_begin(void)
+{
+    PresentSlot *s = &s_slot[s_frame_index % FRAMES_IN_FLIGHT];
+    vkWaitForFences(s_dev, 1, &s->fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(s_dev, 1, &s->fence);
+    return s;
+}
 
 static u32 s_buttons;
 static u8  s_lx = 128, s_ly = 128;
-/* Beyond the PSP's own controls: see present.h. */
 static u8    s_rx = 128, s_ry = 128;
 static float s_tl, s_tr;
 static u32   s_aux;
 static int s_ready;
-/* Read by the GPU backend's pipeline builder (see ge_gpu_vk.c). */
 float g_vk_max_aniso = 1.0f;
 
 #define VK_TRY(expr) do { VkResult vr_ = (expr); if (vr_ != VK_SUCCESS) {   \
@@ -75,15 +82,6 @@ static uint32_t find_mem_type(uint32_t bits, VkMemoryPropertyFlags want)
     return UINT32_MAX;
 }
 
-/* ---- validation layers (SR_VKVALIDATE=1) --------------------------------
- *
- * Off by default: the layer costs a large fraction of the frame. It exists
- * because the GPU backend runs work asynchronously with the CPU, and the two
- * mistakes that shape makes -- writing a buffer the GPU is still reading, and
- * freeing an object an in-flight command buffer still references -- are
- * invisible to every automated check we have. Synchronization validation
- * names both instantly. Turn it on for any change to submission or resource
- * lifetime in ge_gpu_vk.c. */
 static int s_validate;
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(
@@ -145,14 +143,13 @@ static int create_swapchain(void)
     VK_TRY(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_pdev, s_surf, &caps));
     VK_TRY(vkGetPhysicalDeviceSurfaceFormatsKHR(s_pdev, s_surf, &nf, fmts));
 
-    /* Prefer BGRA8 (the byte order we convert into) to avoid a swizzle. */
     pick = fmts[0];
     for (i = 0; i < nf; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM) { pick = fmts[i]; break; }
     s_swap_fmt = pick.format;
 
     ext = caps.currentExtent;
-    if (ext.width == UINT32_MAX) {      /* the surface lets us choose */
+    if (ext.width == UINT32_MAX) {
         int w = 0, h = 0;
         SDL_GetWindowSizeInPixels(s_win, &w, &h);
         ext.width = (uint32_t)w;
@@ -162,7 +159,7 @@ static int create_swapchain(void)
     if (ext.width  > caps.maxImageExtent.width)  ext.width  = caps.maxImageExtent.width;
     if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
     if (ext.height > caps.maxImageExtent.height) ext.height = caps.maxImageExtent.height;
-    if (!ext.width || !ext.height) return 0;      /* minimised */
+    if (!ext.width || !ext.height) return 0;
     s_swap_ext = ext;
 
     n = caps.minImageCount + 1;
@@ -182,9 +179,6 @@ static int create_swapchain(void)
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sci.preTransform     = caps.currentTransform;
     sci.compositeAlpha   = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    /* Pacing belongs to the emulated vblank clock, not the compositor, so the
-     * default asks for MAILBOX (never blocks, never tears). FIFO is always
-     * supported and is the fallback for whatever the player picked. */
     {
         VkPresentModeKHR want = VK_PRESENT_MODE_FIFO_KHR;
         VkPresentModeKHR pm[8];
@@ -203,10 +197,23 @@ static int create_swapchain(void)
     VK_TRY(vkCreateSwapchainKHR(s_dev, &sci, NULL, &s_swap));
     if (old) vkDestroySwapchainKHR(s_dev, old, NULL);
 
-    s_swap_n = 8;
+    s_swap_n = MAX_SWAP_IMAGES;
     VK_TRY(vkGetSwapchainImagesKHR(s_dev, s_swap, &s_swap_n, s_swap_img));
     {
-        void *imgs[8];
+        VkSemaphoreCreateInfo smi;
+        memset(&smi, 0, sizeof smi);
+        smi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        for (i = 0; i < MAX_SWAP_IMAGES; i++) {
+            if (s_sem_done[i]) {
+                vkDestroySemaphore(s_dev, s_sem_done[i], NULL);
+                s_sem_done[i] = VK_NULL_HANDLE;
+            }
+            if (i < s_swap_n)
+                VK_TRY(vkCreateSemaphore(s_dev, &smi, NULL, &s_sem_done[i]));
+        }
+    }
+    {
+        void *imgs[MAX_SWAP_IMAGES];
         for (i = 0; i < s_swap_n; i++) imgs[i] = (void *)s_swap_img[i];
         ui_swapchain((uint32_t)s_swap_fmt, s_swap_ext.width, s_swap_ext.height,
                      s_swap_n, imgs);
@@ -214,7 +221,6 @@ static int create_swapchain(void)
     return 1;
 }
 
-/* The window controls live in the menu; follow them when they move. */
 static void apply_window_settings(void)
 {
     static int last_fs = -1, last_scale = -1;
@@ -222,7 +228,7 @@ static void apply_window_settings(void)
     if (g_gfx.fullscreen != last_fs) {
         last_fs = g_gfx.fullscreen;
         SDL_SetWindowFullscreen(s_win, g_gfx.fullscreen ? true : false);
-        last_scale = -1;                 /* re-apply the size on the way back */
+        last_scale = -1;
     }
     if (!g_gfx.fullscreen && g_gfx.window_scale != last_scale) {
         last_scale = g_gfx.window_scale;
@@ -293,10 +299,7 @@ int present_init(const char *title)
             for (i = 0; i < next && i < 15; i++) ext_names[i] = sdl_ext[i];
             ext_names[i++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
             layer_names[0] = k_val_layer;
-            /* Synchronization validation is the whole point: it is what
-             * reports a host write racing an in-flight read, and a free of an
-             * object a submitted command buffer still uses. */
-            vfe[0] = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+            vfe[0] =VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
             memset(&vf, 0, sizeof vf);
             vf.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
             vf.enabledValidationFeatureCount = 1;
@@ -320,7 +323,6 @@ int present_init(const char *title)
         return 0;
     }
 
-    /* First device with a graphics queue that can present to our surface. */
     VK_TRY(vkEnumeratePhysicalDevices(s_inst, &nd, devs));
     s_pdev = VK_NULL_HANDLE;
     for (d = 0; d < nd && !s_pdev; d++) {
@@ -364,8 +366,6 @@ int present_init(const char *title)
         VkPhysicalDeviceFeatures have, want;
         vkGetPhysicalDeviceFeatures(s_pdev, &have);
         memset(&want, 0, sizeof want);
-        /* Anisotropy keeps minified textures sharp at grazing angles. It is
-         * optional and simply stays off where the driver lacks it. */
         want.samplerAnisotropy = have.samplerAnisotropy;
         if (have.samplerAnisotropy) {
             VkPhysicalDeviceProperties props;
@@ -383,38 +383,17 @@ int present_init(const char *title)
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cpi.queueFamilyIndex = s_qfam;
     VK_TRY(vkCreateCommandPool(s_dev, &cpi, NULL, &s_pool));
-    memset(&cbi, 0, sizeof cbi);
-    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cbi.commandPool = s_pool;
-    cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbi.commandBufferCount = 1;
-    VK_TRY(vkAllocateCommandBuffers(s_dev, &cbi, &s_cmd));
 
     memset(&fci, 0, sizeof fci);
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    VK_TRY(vkCreateFence(s_dev, &fci, NULL, &s_fence));
+    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     memset(&smi, 0, sizeof smi);
     smi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    VK_TRY(vkCreateSemaphore(s_dev, &smi, NULL, &s_sem_acq));
-    VK_TRY(vkCreateSemaphore(s_dev, &smi, NULL, &s_sem_done));
 
-    /* Persistently-mapped upload buffer and the device-local blit source. */
     memset(&bci, 0, sizeof bci);
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size = (VkDeviceSize)PSP_W * PSP_H * 4;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    VK_TRY(vkCreateBuffer(s_dev, &bci, NULL, &s_staging));
-    vkGetBufferMemoryRequirements(s_dev, s_staging, &mr);
-    memset(&mai, 0, sizeof mai);
-    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize = mr.size;
-    mai.memoryTypeIndex = find_mem_type(mr.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-        | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VK_TRY(vkAllocateMemory(s_dev, &mai, NULL, &s_staging_mem));
-    VK_TRY(vkBindBufferMemory(s_dev, s_staging, s_staging_mem, 0));
-    VK_TRY(vkMapMemory(s_dev, s_staging_mem, 0, VK_WHOLE_SIZE, 0,
-                       &s_staging_map));
 
     memset(&imi, 0, sizeof imi);
     imi.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -429,16 +408,45 @@ int present_init(const char *title)
     imi.tiling = VK_IMAGE_TILING_OPTIMAL;
     imi.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     imi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_TRY(vkCreateImage(s_dev, &imi, NULL, &s_fbimg));
-    vkGetImageMemoryRequirements(s_dev, s_fbimg, &mr);
-    mai.allocationSize = mr.size;
-    mai.memoryTypeIndex = find_mem_type(mr.memoryTypeBits,
-                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_TRY(vkAllocateMemory(s_dev, &mai, NULL, &s_fbimg_mem));
-    VK_TRY(vkBindImageMemory(s_dev, s_fbimg, s_fbimg_mem, 0));
 
-    /* The overlay has to exist before the first swapchain: create_swapchain()
-     * hands it the images every time it runs. */
+    memset(&cbi, 0, sizeof cbi);
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbi.commandPool = s_pool;
+    cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbi.commandBufferCount = 1;
+
+    memset(&mai, 0, sizeof mai);
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+
+    {
+        unsigned k;
+        for (k = 0; k < FRAMES_IN_FLIGHT; k++) {
+            PresentSlot *s = &s_slot[k];
+            VK_TRY(vkAllocateCommandBuffers(s_dev, &cbi, &s->cmd));
+            VK_TRY(vkCreateFence(s_dev, &fci, NULL, &s->fence));
+            VK_TRY(vkCreateSemaphore(s_dev, &smi, NULL, &s->acquired));
+
+            VK_TRY(vkCreateBuffer(s_dev, &bci, NULL, &s->staging));
+            vkGetBufferMemoryRequirements(s_dev, s->staging, &mr);
+            mai.allocationSize = mr.size;
+            mai.memoryTypeIndex = find_mem_type(mr.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VK_TRY(vkAllocateMemory(s_dev, &mai, NULL, &s->staging_mem));
+            VK_TRY(vkBindBufferMemory(s_dev, s->staging, s->staging_mem, 0));
+            VK_TRY(vkMapMemory(s_dev, s->staging_mem, 0, VK_WHOLE_SIZE, 0,
+                               &s->staging_map));
+
+            VK_TRY(vkCreateImage(s_dev, &imi, NULL, &s->fbimg));
+            vkGetImageMemoryRequirements(s_dev, s->fbimg, &mr);
+            mai.allocationSize = mr.size;
+            mai.memoryTypeIndex = find_mem_type(mr.memoryTypeBits,
+                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            VK_TRY(vkAllocateMemory(s_dev, &mai, NULL, &s->fbimg_mem));
+            VK_TRY(vkBindImageMemory(s_dev, s->fbimg, s->fbimg_mem, 0));
+        }
+    }
+
     {
         UiVkInfo ui;
         ui.window       = s_win;
@@ -465,8 +473,6 @@ int present_init(const char *title)
     return 1;
 }
 
-/* REF: include/ctrlsvc.h:57-76 for the SCE_CTRL_* bits, and
- * ctrlsvc.h:116-119 for the 0..255 analog axes with 128 at centre. */
 #define SCE_CTRL_SELECT   (1u << 0)
 #define SCE_CTRL_START    (1u << 3)
 #define SCE_CTRL_UP       (1u << 4)
@@ -480,11 +486,9 @@ int present_init(const char *title)
 #define SCE_CTRL_CROSS    (1u << 14)
 #define SCE_CTRL_SQUARE   (1u << 15)
 
-/* SDK-documented stick deadzone, in SDL's -32768..32767 range. */
 #define PAD_DEADZONE 7849
-/* Triggers rest at 0 and travel to 32767, so they need a much smaller floor
- * than a centred stick -- just enough to ignore a resting rattle. */
 #define TRIG_DEADZONE 2600
+#define TRIG_DIGITAL_THRESHOLD 8192
 
 static void poll_input(int *quit)
 {
@@ -497,12 +501,11 @@ static void poll_input(int *quit)
     u32 aux = 0;
 
     while (SDL_PollEvent(&ev)) {
-        /* F4 belongs to the overlay and is never passed on. */
         if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F4 && !ev.key.repeat) {
             ui_toggle();
             continue;
         }
-        if (ui_handle_event(&ev)) continue;      /* the menu took it */
+        if (ui_handle_event(&ev)) continue;
         switch (ev.type) {
         case SDL_EVENT_QUIT:
             *quit = 1;
@@ -526,8 +529,6 @@ static void poll_input(int *quit)
 
     apply_window_settings();
 
-    /* With the menu open the game sees no input at all: no stick drift, no
-     * accidental pause, and typing in the menu cannot reach the game. */
     if (ui_visible()) {
         s_buttons = 0;
         s_lx = s_ly = 128;
@@ -552,9 +553,6 @@ static void poll_input(int *quit)
     if (k[SDL_SCANCODE_LEFT])    b |= SCE_CTRL_LEFT;
     if (k[SDL_SCANCODE_RIGHT])   b |= SCE_CTRL_RIGHT;
 
-    /* Keyboard stands in for the controls the PSP lacks: IJKL looks around,
-     * C clicks the right stick. Full deflection, since keys have no travel --
-     * the guest applies its own deadzone either way. */
     if (k[SDL_SCANCODE_J])       rx = 0;
     if (k[SDL_SCANCODE_L])       rx = 255;
     if (k[SDL_SCANCODE_I])       ry = 0;
@@ -577,10 +575,9 @@ static void poll_input(int *quit)
         PB(SDL_GAMEPAD_BUTTON_DPAD_LEFT,  SCE_CTRL_LEFT);
         PB(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SCE_CTRL_RIGHT);
 #undef PB
-        /* The PSP has shoulder buttons, not analog triggers. */
-        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8192)
+        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIG_DIGITAL_THRESHOLD)
             b |= SCE_CTRL_LTRIGGER;
-        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8192)
+        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIG_DIGITAL_THRESHOLD)
             b |= SCE_CTRL_RTRIGGER;
         {
             int ax = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTX);
@@ -590,9 +587,6 @@ static void poll_input(int *quit)
             if (ay < -PAD_DEADZONE || ay > PAD_DEADZONE)
                 ly = (u8)((ay + 32768) * 255 / 65535);
         }
-        /* Right stick, same encoding as the left one so the guest's own axis
-         * conditioning applies to it unchanged. SDL's Y is +down, which is
-         * also what the engine expects (Y >= 113 means DOWN). */
         {
             int ax = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHTX);
             int ay = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHTY);
@@ -601,11 +595,6 @@ static void poll_input(int *quit)
             if (ay < -PAD_DEADZONE || ay > PAD_DEADZONE)
                 ry = (u8)((ay + 32768) * 255 / 65535);
         }
-        /* Trigger travel, kept as a float beside the digital bit above. The
-         * bit is what the PSP had and the game already understands; the float
-         * is the extra resolution the pad has and the PSP never did. Rescaled
-         * so it starts from zero at the edge of the deadzone rather than
-         * jumping to it. */
         {
             int at = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
             int bt = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
@@ -674,10 +663,6 @@ static void barrier(VkCommandBuffer cmd, VkImage img,
     vkCmdPipelineBarrier(cmd, src_st, dst_st, 0, 0, NULL, 0, NULL, 1, &mb);
 }
 
-/* Colour controls. Gamma, brightness and contrast are per-channel, so they
- * collapse into one 256-entry table rebuilt only when the settings change;
- * saturation mixes channels and costs a few instructions per pixel, so it is
- * skipped entirely at 1.0. */
 static uint8_t  s_clut[256];
 static unsigned s_clut_gen;
 static int      s_clut_identity = 1;
@@ -701,12 +686,11 @@ static void colour_lut_update(void)
     }
 }
 
-/* Guest frame buffer -> BGRA8, via the same unpack as the frame dump so the
- * window and the BMPs cannot disagree. */
-static void convert_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
+static void convert_frame(void *dst_map, u8 *ram, u32 addr, u32 stride,
+                          int fpf, int w, int h)
 {
     unsigned bpp = (fpf == 3) ? 4u : 2u;
-    uint32_t *dst = (uint32_t *)s_staging_map;
+    uint32_t *dst = (uint32_t *)dst_map;
     float sat = g_gfx.saturation;
     int x, y;
 
@@ -732,7 +716,6 @@ static void convert_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
                 }
                 rgba = (rgba & 0xFF000000u) | (b << 16) | (g << 8) | r;
             }
-            /* rgba is 0xAABBGGRR; the swapchain wants 0xAARRGGBB. */
             dst[y * w + x] = (rgba & 0xFF00FF00u)
                            | ((rgba & 0x00FF0000u) >> 16)
                            | ((rgba & 0x000000FFu) << 16);
@@ -740,7 +723,6 @@ static void convert_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
     }
 }
 
-/* Where the guest frame lands inside the window, per aspect mode. */
 static void present_rect(int dw, int dh, int w, int h,
                          int *x0, int *y0, int *vw, int *vh)
 {
@@ -760,7 +742,7 @@ static void present_rect(int dw, int dh, int w, int h,
         *x0 = (dw - *vw) / 2; *y0 = (dh - *vh) / 2;
         return;
     }
-    default: break;                     /* ASPECT_KEEP */
+    default: break;
     }
     *vw = dw;
     *vh = dw * ah / aw;
@@ -773,6 +755,7 @@ int present_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
 {
     int quit = 0;
     int attempt;
+    PresentSlot *slot;
 
     if (!s_ready) return 1;
     poll_input(&quit);
@@ -782,7 +765,8 @@ int present_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
     if (w > PSP_W) w = PSP_W;
     if (h > PSP_H) h = PSP_H;
 
-    convert_frame(ram, addr, stride, fpf, w, h);
+    slot = slot_begin();
+    convert_frame(slot->staging_map, ram, addr, stride, fpf, w, h);
 
     for (attempt = 0; attempt < 2; attempt++) {
         uint32_t idx = 0;
@@ -795,22 +779,22 @@ int present_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
         VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         int dw, dh, vw, vh, x0, y0;
 
-        ar = vkAcquireNextImageKHR(s_dev, s_swap, UINT64_MAX, s_sem_acq,
+        ar = vkAcquireNextImageKHR(s_dev, s_swap, UINT64_MAX, slot->acquired,
                                    VK_NULL_HANDLE, &idx);
         if (ar == VK_ERROR_OUT_OF_DATE_KHR || ar == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(s_dev);
-            if (!create_swapchain()) return 1;   /* minimised: drop the frame */
+            if (!create_swapchain()) { vkResetFences(s_dev, 1, &slot->fence); return 1; }
             continue;
         }
-        if (ar != VK_SUCCESS) return 1;
+        if (ar != VK_SUCCESS) { vkResetFences(s_dev, 1, &slot->fence); return 1; }
 
         memset(&bi, 0, sizeof bi);
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkResetCommandBuffer(s_cmd, 0);
-        vkBeginCommandBuffer(s_cmd, &bi);
+        vkResetCommandBuffer(slot->cmd, 0);
+        vkBeginCommandBuffer(slot->cmd, &bi);
 
-        barrier(s_cmd, s_fbimg, VK_IMAGE_LAYOUT_UNDEFINED,
+        barrier(slot->cmd, slot->fbimg, VK_IMAGE_LAYOUT_UNDEFINED,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -821,18 +805,14 @@ int present_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
         bic.imageExtent.width = (uint32_t)w;
         bic.imageExtent.height = (uint32_t)h;
         bic.imageExtent.depth = 1;
-        vkCmdCopyBufferToImage(s_cmd, s_staging, s_fbimg,
+        vkCmdCopyBufferToImage(slot->cmd, slot->staging, slot->fbimg,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
-        barrier(s_cmd, s_fbimg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        barrier(slot->cmd, slot->fbimg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-        /* srcStage is the stage the acquire semaphore is waited at, not
-         * TOP_OF_PIPE: the layout transition is a write, and at TOP_OF_PIPE it
-         * would be ordered BEFORE that wait, racing the presentation engine's
-         * own use of the image. */
-        barrier(s_cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_UNDEFINED,
+        barrier(slot->cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_UNDEFINED,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -848,12 +828,10 @@ int present_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
             rng.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             rng.baseMipLevel = 0; rng.levelCount = 1;
             rng.baseArrayLayer = 0; rng.layerCount = 1;
-            vkCmdClearColorImage(s_cmd, s_swap_img[idx],
+            vkCmdClearColorImage(slot->cmd, s_swap_img[idx],
                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  &bar, 1, &rng);
-            /* The blit below writes the same image; without this the letterbox
-             * clear and the blit are unordered writes to overlapping memory. */
-            barrier(s_cmd, s_swap_img[idx],
+            barrier(slot->cmd, s_swap_img[idx],
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -861,7 +839,6 @@ int present_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
                     VK_PIPELINE_STAGE_TRANSFER_BIT);
         }
 
-        /* Aspect-correct letterbox: the PSP is 480x272, the window is not. */
         dw = (int)s_swap_ext.width;
         dh = (int)s_swap_ext.height;
         present_rect(dw, dh, w, h, &x0, &y0, &vw, &vh);
@@ -878,46 +855,41 @@ int present_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
         blt.dstOffsets[1].x = x0 + vw;
         blt.dstOffsets[1].y = y0 + vh;
         blt.dstOffsets[1].z = 1;
-        vkCmdBlitImage(s_cmd,
-                       s_fbimg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        vkCmdBlitImage(slot->cmd,
+                       slot->fbimg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &blt,
                        g_gfx.present_filter ? VK_FILTER_LINEAR
                                             : VK_FILTER_NEAREST);
 
-        /* The overlay's render pass ends in PRESENT_SRC; without it (or with
-         * the overlay unavailable) the transition is ours to make. */
-        if (!ui_render(s_cmd, idx))
-            barrier(s_cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        if (!ui_render(slot->cmd, idx))
+            barrier(slot->cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                     VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-        vkEndCommandBuffer(s_cmd);
+        vkEndCommandBuffer(slot->cmd);
 
         memset(&si, 0, sizeof si);
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &s_sem_acq;
+        si.pWaitSemaphores = &slot->acquired;
         si.pWaitDstStageMask = &wait_stage;
         si.commandBufferCount = 1;
-        si.pCommandBuffers = &s_cmd;
+        si.pCommandBuffers = &slot->cmd;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &s_sem_done;
-        vkResetFences(s_dev, 1, &s_fence);
-        vkQueueSubmit(s_queue, 1, &si, s_fence);
+        si.pSignalSemaphores = &s_sem_done[idx];
+        vkQueueSubmit(s_queue, 1, &si, slot->fence);
+        s_frame_index++;
 
         memset(&pi, 0, sizeof pi);
         pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &s_sem_done;
+        pi.pWaitSemaphores = &s_sem_done[idx];
         pi.swapchainCount = 1;
         pi.pSwapchains = &s_swap;
         pi.pImageIndices = &idx;
         pr = vkQueuePresentKHR(s_queue, &pi);
-
-        /* One frame in flight: wait before reusing staging/command buffers. */
-        vkWaitForFences(s_dev, 1, &s_fence, VK_TRUE, UINT64_MAX);
 
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(s_dev);
@@ -925,6 +897,7 @@ int present_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
         }
         return 1;
     }
+    vkResetFences(s_dev, 1, &slot->fence);
     return 1;
 }
 
@@ -941,13 +914,12 @@ int present_get_vk(PresentVkInfo *out)
     return 1;
 }
 
-/* Same as present_frame but sourced from a backend-owned image; no staging
- * upload. */
 int present_image(void *vk_image, int src_w, int src_h)
 {
     VkImage src = (VkImage)vk_image;
     int quit = 0;
     int attempt;
+    PresentSlot *slot;
 
     if (src_w <= 0) src_w = PSP_W;
     if (src_h <= 0) src_h = PSP_H;
@@ -956,6 +928,8 @@ int present_image(void *vk_image, int src_w, int src_h)
     poll_input(&quit);
     if (quit) return 0;
     ui_new_frame();
+
+    slot = slot_begin();
 
     for (attempt = 0; attempt < 2; attempt++) {
         uint32_t idx = 0;
@@ -967,26 +941,28 @@ int present_image(void *vk_image, int src_w, int src_h)
         VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         int dw, dh, vw, vh, x0, y0;
 
-        ar = vkAcquireNextImageKHR(s_dev, s_swap, UINT64_MAX, s_sem_acq,
+        ar = vkAcquireNextImageKHR(s_dev, s_swap, UINT64_MAX, slot->acquired,
                                    VK_NULL_HANDLE, &idx);
         if (ar == VK_ERROR_OUT_OF_DATE_KHR || ar == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(s_dev);
-            if (!create_swapchain()) return 1;   /* minimised: drop the frame */
+            if (!create_swapchain()) { vkResetFences(s_dev, 1, &slot->fence); return 1; }
             continue;
         }
-        if (ar != VK_SUCCESS) return 1;
+        if (ar != VK_SUCCESS) { vkResetFences(s_dev, 1, &slot->fence); return 1; }
 
         memset(&bi, 0, sizeof bi);
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkResetCommandBuffer(s_cmd, 0);
-        vkBeginCommandBuffer(s_cmd, &bi);
+        vkResetCommandBuffer(slot->cmd, 0);
+        vkBeginCommandBuffer(slot->cmd, &bi);
 
-        /* srcStage is the stage the acquire semaphore is waited at, not
-         * TOP_OF_PIPE: the layout transition is a write, and at TOP_OF_PIPE it
-         * would be ordered BEFORE that wait, racing the presentation engine's
-         * own use of the image. */
-        barrier(s_cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_UNDEFINED,
+        barrier(slot->cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        barrier(slot->cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_UNDEFINED,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -999,12 +975,10 @@ int present_image(void *vk_image, int src_w, int src_h)
             rng.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             rng.baseMipLevel = 0; rng.levelCount = 1;
             rng.baseArrayLayer = 0; rng.layerCount = 1;
-            vkCmdClearColorImage(s_cmd, s_swap_img[idx],
+            vkCmdClearColorImage(slot->cmd, s_swap_img[idx],
                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  &black, 1, &rng);
-            /* The blit below writes the same image; without this the letterbox
-             * clear and the blit are unordered writes to overlapping memory. */
-            barrier(s_cmd, s_swap_img[idx],
+            barrier(slot->cmd, s_swap_img[idx],
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1014,14 +988,11 @@ int present_image(void *vk_image, int src_w, int src_h)
 
         dw = (int)s_swap_ext.width;
         dh = (int)s_swap_ext.height;
-        /* Aspect is decided in PSP pixels: a supersampled source has more
-         * pixels but the same shape. */
         present_rect(dw, dh, PSP_W, PSP_H, &x0, &y0, &vw, &vh);
 
         memset(&blt, 0, sizeof blt);
         blt.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         blt.srcSubresource.layerCount = 1;
-        /* The visible region of the source, in the source's own pixels. */
         blt.srcOffsets[1].x = src_w;
         blt.srcOffsets[1].y = src_h;
         blt.srcOffsets[1].z = 1;
@@ -1031,43 +1002,39 @@ int present_image(void *vk_image, int src_w, int src_h)
         blt.dstOffsets[1].x = x0 + vw;
         blt.dstOffsets[1].y = y0 + vh;
         blt.dstOffsets[1].z = 1;
-        vkCmdBlitImage(s_cmd,
+        vkCmdBlitImage(slot->cmd,
                        src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &blt, VK_FILTER_LINEAR);
 
-        /* The overlay's render pass ends in PRESENT_SRC; without it (or with
-         * the overlay unavailable) the transition is ours to make. */
-        if (!ui_render(s_cmd, idx))
-            barrier(s_cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        if (!ui_render(slot->cmd, idx))
+            barrier(slot->cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                     VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-        vkEndCommandBuffer(s_cmd);
+        vkEndCommandBuffer(slot->cmd);
 
         memset(&si, 0, sizeof si);
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &s_sem_acq;
+        si.pWaitSemaphores = &slot->acquired;
         si.pWaitDstStageMask = &wait_stage;
         si.commandBufferCount = 1;
-        si.pCommandBuffers = &s_cmd;
+        si.pCommandBuffers = &slot->cmd;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &s_sem_done;
-        vkResetFences(s_dev, 1, &s_fence);
-        vkQueueSubmit(s_queue, 1, &si, s_fence);
+        si.pSignalSemaphores = &s_sem_done[idx];
+        vkQueueSubmit(s_queue, 1, &si, slot->fence);
+        s_frame_index++;
 
         memset(&pi, 0, sizeof pi);
         pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &s_sem_done;
+        pi.pWaitSemaphores = &s_sem_done[idx];
         pi.swapchainCount = 1;
         pi.pSwapchains = &s_swap;
         pi.pImageIndices = &idx;
         pr = vkQueuePresentKHR(s_queue, &pi);
-
-        vkWaitForFences(s_dev, 1, &s_fence, VK_TRUE, UINT64_MAX);
 
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(s_dev);
@@ -1075,11 +1042,10 @@ int present_image(void *vk_image, int src_w, int src_h)
         }
         return 1;
     }
+    vkResetFences(s_dev, 1, &slot->fence);
     return 1;
 }
 
-/* Bring up the GPU rasteriser on this window's device; PSPRECO_GPU=0 keeps
- * the software rasteriser instead. */
 int present_gpu_init(void)
 {
     const char *e = getenv("PSPRECO_GPU");
@@ -1094,17 +1060,26 @@ int present_gpu_init(void)
 
 void present_shutdown(void)
 {
+    void gegpu_shutdown(void);
     if (!s_dev) return;
+    gegpu_shutdown();
     ui_shutdown();
     vkDeviceWaitIdle(s_dev);
     if (s_swap) vkDestroySwapchainKHR(s_dev, s_swap, NULL);
-    if (s_fbimg) vkDestroyImage(s_dev, s_fbimg, NULL);
-    if (s_fbimg_mem) vkFreeMemory(s_dev, s_fbimg_mem, NULL);
-    if (s_staging) vkDestroyBuffer(s_dev, s_staging, NULL);
-    if (s_staging_mem) vkFreeMemory(s_dev, s_staging_mem, NULL);
-    if (s_sem_acq) vkDestroySemaphore(s_dev, s_sem_acq, NULL);
-    if (s_sem_done) vkDestroySemaphore(s_dev, s_sem_done, NULL);
-    if (s_fence) vkDestroyFence(s_dev, s_fence, NULL);
+    {
+        unsigned k;
+        for (k = 0; k < FRAMES_IN_FLIGHT; k++) {
+            PresentSlot *s = &s_slot[k];
+            if (s->fbimg) vkDestroyImage(s_dev, s->fbimg, NULL);
+            if (s->fbimg_mem) vkFreeMemory(s_dev, s->fbimg_mem, NULL);
+            if (s->staging) vkDestroyBuffer(s_dev, s->staging, NULL);
+            if (s->staging_mem) vkFreeMemory(s_dev, s->staging_mem, NULL);
+            if (s->acquired) vkDestroySemaphore(s_dev, s->acquired, NULL);
+            if (s->fence) vkDestroyFence(s_dev, s->fence, NULL);
+        }
+        for (k = 0; k < MAX_SWAP_IMAGES; k++)
+            if (s_sem_done[k]) vkDestroySemaphore(s_dev, s_sem_done[k], NULL);
+    }
     if (s_pool) vkDestroyCommandPool(s_dev, s_pool, NULL);
     vkDestroyDevice(s_dev, NULL);
     if (s_surf) vkDestroySurfaceKHR(s_inst, s_surf, NULL);

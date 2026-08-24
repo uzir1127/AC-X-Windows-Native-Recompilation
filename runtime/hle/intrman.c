@@ -1,17 +1,7 @@
-/* runtime/hle/intrman.c -- InterruptManager HLE plus vblank dispatch.
- *
- * The SubIntr calls have no prototype in the 6.6.0 firmware headers (only the
- * stub archive exports them) and no header names the vblank interrupt
- * number. Vblank handlers are called (int idx, void *cookie) at the start
- * of each vertical blank, per sceDisplaySetVblankCallback's contract.
- */
-
 #include "hle.h"
 #include "sce_errors.h"
 #include "threadman.h"
 
-/* The interrupt the game registers its frame handler on; the number is
- * observed from the game, not documented anywhere. */
 #define PSPRECO_VBLANK_INTR 30
 
 #define MAX_SUBINTR 16
@@ -21,7 +11,7 @@ typedef struct {
     int enabled;
     u32 intr;
     u32 sub;
-    u32 handler;   /* guest address */
+    u32 handler;
     u32 arg;
 } SubIntr;
 
@@ -37,8 +27,6 @@ static SubIntr *find_subintr(u32 intr, u32 sub)
     return NULL;
 }
 
-/* int sceKernelRegisterSubIntrHandler(int intr, int sub, void *handler,
- *                                     void *arg) */
 void hle_sceKernelRegisterSubIntrHandler(CpuCtx *c, u8 *ram)
 {
     u32 intr = HLE_A0, sub = HLE_A1, handler = HLE_A2, arg = HLE_A3;
@@ -61,7 +49,6 @@ void hle_sceKernelRegisterSubIntrHandler(CpuCtx *c, u8 *ram)
     s->sub = sub;
     s->handler = handler;
     s->arg = arg;
-    /* Registration does not enable: sceKernelEnableSubIntr does. */
     hle_log("[hle] sceKernelRegisterSubIntrHandler(intr=%u, sub=%u, "
             "handler=%08x, arg=%08x)%s", intr, sub, handler, arg,
             intr == PSPRECO_VBLANK_INTR ? "  [vblank]" : "");
@@ -100,10 +87,6 @@ void hle_sceKernelEnableSubIntr(CpuCtx *c, u8 *ram)
     HLE_RET(0);
 }
 
-/* Run every enabled handler for `intr` on the current fiber, saving and
- * restoring the caller's context around each; args are (sub, cookie).
- * Handlers run when the frame heartbeat advances rather than preemptively
- * -- equivalent for handlers that only touch their own state. */
 int intrman_dispatch(CpuCtx *c, u8 *ram, u32 intr)
 {
     int i, ran = 0;

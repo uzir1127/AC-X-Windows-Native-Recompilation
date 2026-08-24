@@ -1,16 +1,3 @@
-/* sceGe renderer: state machine, T&L, and the software rasteriser.
- *
- * Ported from the previous project's GE; pixel rules derive from PPSSPP's
- * software renderer (GPLv2+). Display-list control flow (queueing, stall,
- * SIGNAL/FINISH) stays in runtime/hle/ge.c, which feeds each state word
- * through ge_state_command() and each PRIM through ge_draw_prim().
- *
- * Not emulated: stencil ops (PSP stencil lives in destination alpha), logic
- * ops, colour test, bezier/spline patches, mipmaps (level 0 only).
- *
- * Each GE command word is (cmd<<24)|data24.
- */
-
 #include "pspreco.h"
 #include "ge.h"
 #include "ge_shared.h"
@@ -23,7 +10,6 @@
 #include <stdlib.h>
 #include <time.h>
 
-/* Guest memory: flat RAM window; the ported code's MEM_* macros map onto it. */
 static u8 *s_ram;
 #define MEM_R8(a)   mem_r8(s_ram, (a))
 #define MEM_R16(a)  mem_r16(s_ram, (a))
@@ -32,10 +18,8 @@ static u8 *s_ram;
 #define MEM_W32(a, v) mem_w32(s_ram, (a), (v))
 #define SR_HOST(a)  (s_ram + ((a) & PSP_ADDR_MASK))
 
-/* Wall-clock ms (MinGW clock() is wall time with CLOCKS_PER_SEC=1000). */
 static unsigned long wall_ms(void) { return (unsigned long)(clock() * 1000ull / CLOCKS_PER_SEC); }
 
-/* ---- command numbers (subset) ---- */
 enum {
     GE_NOP = 0x00, GE_VADDR = 0x01, GE_IADDR = 0x02, GE_PRIM = 0x04,
     GE_BEZIER = 0x05, GE_SPLINE = 0x06, GE_BOUNDINGBOX = 0x07,
@@ -50,6 +34,7 @@ enum {
     GE_ALPHATESTENABLE = 0x22, GE_ZTESTENABLE = 0x23, GE_STENCILTESTENABLE = 0x24,
     GE_ANTIALIASENABLE = 0x25, GE_PATCHCULLENABLE = 0x26,
     GE_COLORTESTENABLE = 0x27, GE_LOGICOPENABLE = 0x28,
+    GE_BONEMATRIXNUMBER = 0x2A, GE_BONEMATRIXDATA = 0x2B,
     GE_PATCHDIVISION = 0x36, GE_PATCHPRIMITIVE = 0x37, GE_PATCHFACING = 0x38,
     GE_WORLDMATRIXNUMBER = 0x3A, GE_WORLDMATRIXDATA = 0x3B,
     GE_VIEWMATRIXNUMBER  = 0x3C, GE_VIEWMATRIXDATA  = 0x3D,
@@ -63,10 +48,10 @@ enum {
     GE_MATERIALEMISSIVE = 0x54, GE_MATERIALAMBIENT = 0x55, GE_MATERIALDIFFUSE = 0x56,
     GE_MATERIALSPECULAR = 0x57, GE_MATERIALALPHA = 0x58, GE_MATERIALSPECULARCOEF = 0x5B,
     GE_AMBIENTCOLOR = 0x5C, GE_AMBIENTALPHA = 0x5D, GE_LIGHTMODE = 0x5E,
-    GE_LIGHTTYPE0 = 0x5F,                       /* ..0x62 */
-    GE_LX0 = 0x63, GE_LDX0 = 0x6F, GE_LKA0 = 0x7B,   /* pos / dir / attenuation, 12 each */
-    GE_LKS0 = 0x87, GE_LKO0 = 0x8B,                  /* spot exponent / cutoff, 4 each */
-    GE_LAC0 = 0x8F,                                  /* light colours amb/diff/spec ×4 = 12 */
+    GE_LIGHTTYPE0 = 0x5F,
+    GE_LX0 = 0x63, GE_LDX0 = 0x6F, GE_LKA0 = 0x7B,
+    GE_LKS0 = 0x87, GE_LKO0 = 0x8B,
+    GE_LAC0 = 0x8F,
     GE_CULL = 0x9B,
     GE_FRAMEBUFPTR = 0x9C, GE_FRAMEBUFWIDTH = 0x9D, GE_ZBUFPTR = 0x9E, GE_ZBUFWIDTH = 0x9F,
     GE_TEXADDR0 = 0xA0, GE_TEXBUFWIDTH0 = 0xA8,
@@ -92,11 +77,9 @@ enum {
     GE_TRANSFERDSTPOS = 0xEC, GE_TRANSFERSIZE = 0xEE,
 };
 
-/* GeState lives in ge_shared.h (shared with the optional GPU backend). */
 static GeState ge;
 static int s_ge_inited = 0;
 
-/* Optional GPU rasterizer hooks (ge_shared.h). NULL = pure software. */
 static const GeGpuHooks *s_gpu = NULL;
 void ge_set_gpu_hooks(const GeGpuHooks *h) { s_gpu = h; }
 GeState *ge_state_ptr(void) { return &ge; }
@@ -106,11 +89,8 @@ void ge_gpu_vram_dirty(u32 addr, u32 bytes) {
 void ge_gpu_flush(const char *reason) {
     if (s_gpu && s_gpu->flush) s_gpu->flush(reason);
 }
-/* Registered by the GPU backend; NULL means present from guest VRAM. */
 int (*ge_gpu_present_fn)(u32 fbaddr, int fmt, u32 stride) = NULL;
 
-/* Decode a GE 24-bit float mantissa word to IEEE-754 float.
- * The GE stores floats as the upper 24 bits of a 32-bit float (mantissa only; exp+sign). */
 static float decode_float24(uint32_t data) {
     uint32_t f = data << 8;
     float r; memcpy(&r, &f, 4); return r;
@@ -121,13 +101,10 @@ static void ge_state_init(void) {
     ge.maxz = 0xFFFF;
     ge.tex_scale_u = ge.tex_scale_v = 1.0f;
     ge.shade_gouraud = 1;
-    ge.amb_alpha = 0xFF;   /* lit alpha multiplies by this; 0 would blank lit geometry pre-init */
+    ge.amb_alpha = 0xFF;
     s_ge_inited = 1;
 }
 
-/* ---- Depth buffer ----
- * Software 16-bit depth buffer, one entry per pixel, max stride 512.
- * Only active when ge.ztest_enable is set. */
 static uint16_t s_zbuf[272 * 512];
 
 static uint32_t zbuf_stride(void) { return ge.zbw ? ge.zbw : (ge.fbw ? ge.fbw : 512); }
@@ -171,27 +148,22 @@ static int ztest_px(int x, int y, uint16_t z) {
     return pass;
 }
 
-/* Clamp interpolated depth to 16 bits. minz/maxz are NOT a clamp (see zrange_ok). */
 static uint16_t clamp_z(float zf) {
     if (zf < 0.0f) zf = 0.0f; else if (zf > 65535.0f) zf = 65535.0f;
     return (uint16_t)zf;
 }
 
-/* PSP depth-range test (per PPSSPP): transform-mode pixels with z outside
- * [minz,maxz] are DISCARDED — even in clear mode, even with z-test disabled. */
 static int zrange_ok(float zf, int persp) {
     if (!persp) return 1;
     int z = (int)zf;
     return z >= (int)ge.minz && z <= (int)ge.maxz;
 }
 
-/* Decode the vertex format. Supports 8/16/float texcoord, colour, normal, and position.
- * Returns the stride; fills offsets (-1 if absent). through=1 means screen-space (2D). */
 typedef struct {
     int stride, tc_off, tc_fmt, col_off, col_fmt;
-    int nrm_off, nrm_fmt;    /* normal (lighting; -1 if absent) */
+    int nrm_off, nrm_fmt;
     int pos_off, pos_fmt;
-    int w_off, w_fmt, w_n;   /* skinning weights (w_n==0 if absent) */
+    int w_off, w_fmt, w_n;
     int through;
 } VFmt;
 
@@ -199,16 +171,14 @@ static void decode_vtype(uint32_t vt, VFmt *v) {
     memset(v, 0, sizeof(*v));
     v->nrm_off = -1; v->tc_off = -1; v->col_off = -1;
     int tc = vt & 3, col = (vt >> 2) & 7, nrm = (vt >> 5) & 3, pos = (vt >> 7) & 3;
-    int wt = (vt >> 9) & 3;   /* weight format (skinning) */
-    int wc = (vt >> 14) & 7;  /* weight count */
+    int wt = (vt >> 9) & 3;
+    int wc = (vt >> 14) & 7;
     v->through = (vt >> 23) & 1;
 
-    static const int csz[4] = { 0, 1, 2, 4 };               /* none/8-bit/16-bit/float */
-    static const int colsz[8] = { 0, 0, 0, 0, 2, 2, 2, 4 }; /* 4=5650,5=5551,6=4444,7=8888 */
+    static const int csz[4] = { 0, 1, 2, 4 };
+    static const int colsz[8] = { 0, 0, 0, 0, 2, 2, 2, 4 };
     int off = 0, maxa = 1;
 
-    /* Skinning weights come first if present. The count field is n-1: wc==0 with a
-     * nonzero format means ONE weight. */
     if (wt) {
         int a = csz[wt];
         off = (off + a - 1) & ~(a - 1);
@@ -232,8 +202,6 @@ static void decode_vtype(uint32_t vt, VFmt *v) {
     v->stride = (off + maxa - 1) & ~(maxa - 1);
 }
 
-/* Read position. Transform-mode fixed-point normalizes like the hardware: s8/128,
- * s16/32768. Through-mode keeps raw screen units (x/y signed, z unsigned 0..65535). */
 static void read_pos(uint32_t addr, const VFmt *v, float *x, float *y, float *z) {
     uint32_t a = addr + (uint32_t)v->pos_off;
     if (v->pos_fmt == 3) {
@@ -262,8 +230,6 @@ static void read_pos(uint32_t addr, const VFmt *v, float *x, float *y, float *z)
     }
 }
 
-/* Read texcoords. Through-mode: absolute texels. Transform-mode: UNSIGNED u8/128
- * and u16/32768 (signed reads would flip UVs >= half range). */
 static void read_tc(uint32_t addr, const VFmt *v, float *u, float *tv) {
     if (v->tc_off < 0) { *u = 0; *tv = 0; return; }
     uint32_t a = addr + (uint32_t)v->tc_off;
@@ -289,7 +255,6 @@ static void read_tc(uint32_t addr, const VFmt *v, float *u, float *tv) {
     }
 }
 
-/* Read a vertex normal (model space). Defaults to +Z when absent. */
 static void read_nrm(uint32_t addr, const VFmt *v, float *x, float *y, float *z) {
     if (v->nrm_off < 0) { *x = 0; *y = 0; *z = 1; return; }
     uint32_t a = addr + (uint32_t)v->nrm_off;
@@ -308,7 +273,6 @@ static void read_nrm(uint32_t addr, const VFmt *v, float *x, float *y, float *z)
     if (ge.reverse_normal) { *x = -*x; *y = -*y; *z = -*z; }
 }
 
-/* Skinning weights: unsigned fixed-point, u8/128 and u16/32768; float raw. */
 static void read_weights(uint32_t addr, const VFmt *v, float *w) {
     uint32_t a = addr + (uint32_t)v->w_off;
     for (int i = 0; i < v->w_n; i++) {
@@ -318,8 +282,6 @@ static void read_weights(uint32_t addr, const VFmt *v, float *w) {
     }
 }
 
-/* Convert a colour in PSP pixel format `psm` (0=5650,1=5551,2=4444,3=8888) read from `raw` into
- * 8-bit R,G,B,A. For 16-bit formats `raw` holds the 16-bit value; for 8888 the full 32 bits. */
 static void unpack_color(uint32_t raw, int psm, int *r, int *g, int *b, int *a) {
     switch (psm & 3) {
         case 0: *r=(int)((raw&0x1F)*255/31); *g=(int)(((raw>>5)&0x3F)*255/63); *b=(int)(((raw>>11)&0x1F)*255/31); *a=255; break;
@@ -329,7 +291,6 @@ static void unpack_color(uint32_t raw, int psm, int *r, int *g, int *b, int *a) 
     }
 }
 
-/* Read a vertex colour into 8-bit RGBA (col_fmt: 4=5650,5=5551,6=4444,7=8888). */
 static void read_color(uint32_t addr, const VFmt *v, int *r, int *g, int *b, int *a) {
     if (v->col_off < 0) {
         if (ge.material_set || ge.material_alpha_set) {
@@ -347,7 +308,6 @@ static void read_color(uint32_t addr, const VFmt *v, int *r, int *g, int *b, int
     else unpack_color(MEM_R16(ca), v->col_fmt - 4, r, g, b, a);
 }
 
-/* Look up a CLUT entry (palette index -> RGBA). */
 static void clut_lookup(uint32_t index, int *r, int *g, int *b, int *a) {
     uint32_t shift = (ge.clut_fmt >> 2) & 0x1F;
     uint32_t mask  = (ge.clut_fmt >> 8) & 0xFF;
@@ -359,23 +319,39 @@ static void clut_lookup(uint32_t index, int *r, int *g, int *b, int *a) {
     else           { uint16_t raw; memcpy(&raw, &ge.clutram[(index * 2) & 2047], 2); unpack_color(raw, epsm, r, g, b, a); }
 }
 
+#define CLUT_TABLE_ENTRIES 256
+
+static uint32_t s_clut_rgba[CLUT_TABLE_ENTRIES];
+static uint32_t s_clut_table_gen = 0xFFFFFFFFu;
+static uint32_t s_clut_table_fmt = 0xFFFFFFFFu;
+
+static void clut_table_build(void) {
+    if (s_clut_table_gen == ge.clut_gen && s_clut_table_fmt == ge.clut_fmt) return;
+    for (uint32_t i = 0; i < CLUT_TABLE_ENTRIES; i++) {
+        int r, g, b, a;
+        clut_lookup(i, &r, &g, &b, &a);
+        s_clut_rgba[i] = (uint32_t)(r & 0xFF) | ((uint32_t)(g & 0xFF) << 8)
+                       | ((uint32_t)(b & 0xFF) << 16) | ((uint32_t)(a & 0xFF) << 24);
+    }
+    s_clut_table_gen = ge.clut_gen;
+    s_clut_table_fmt = ge.clut_fmt;
+}
+
 unsigned long g_tex_samples = 0, g_tex_nonzero = 0;
 static uint32_t s_ge_frame = 0;
 
-/* ---- Per-frame statistics (SR_GESTAT=1: print every 60 frames) ---- */
 static struct {
     unsigned long tri2d, tri3d, spr2d, spr3d, cull, nearclip, zfail, afail, px2d, px3d, zrange;
-    unsigned long mw_world, mw_view, mw_proj;   /* matrix data words captured */
-    unsigned long xform;      /* vertex transforms actually performed */
-    unsigned long blk3d;                        /* 3D pixels written with final RGB == 0 */
-    uint32_t fbs[4]; unsigned long fbn[4];      /* distinct draw-buffer addrs hit + pixel counts */
-    unsigned long fog0, fogfull, texa0;         /* full-fog pixels, no-fog pixels, alpha==0 texels */
-    unsigned long skin, bonew;                  /* skinned (weighted) 3D prims, bone matrix writes */
-    unsigned long deg3d;                        /* zero-area 3D triangles (zeroed/missing vertex data) */
-    unsigned long line3d;                       /* 3D line segments submitted (wireframe map etc.) */
+    unsigned long mw_world, mw_view, mw_proj;
+    unsigned long xform;
+    unsigned long blk3d;
+    uint32_t fbs[4]; unsigned long fbn[4];
+    unsigned long fog0, fogfull, texa0;
+    unsigned long skin, bonew;
+    unsigned long deg3d;
+    unsigned long line3d;
 } s_stat;
 
-/* SR_GEMATW=1: trace the first view/proj matrix register writes. */
 static void trace_mtx_write(const char *name, int cursor, uint32_t data) {
     static int on = -1, n = 0;
     if (on < 0) on = getenv("SR_GEMATW") ? 1 : 0;
@@ -384,26 +360,13 @@ static void trace_mtx_write(const char *name, int cursor, uint32_t data) {
     fprintf(stderr, "GEMATW f=%u %s[%d] = 0x%06x (%g)\n",
             s_ge_frame, name, cursor, data, decode_float24(data));
 }
-static void ge_snapshot_plain(const char *path);   /* defined near ge_snapshot below */
+static void ge_snapshot_plain(const char *path);
 
 static int s_stat_on = -1;
-unsigned long g_ge_us_acc = 0;   /* us spent running GE lists; fed by ge.c */
+unsigned long g_ge_us_acc = 0;
 
-/* SR_GEPROF=1 splits the GE budget by phase. Off by default: the timers sit on
- * a per-triangle path, so they cost a few percent when enabled and nothing at
- * all when not. Enabled, they answer "which part of the renderer is slow"
- * outright, which repeated guessing did not. */
-/* These are CPU TICKS, not microseconds: display.c converts them using the
- * tick total over the same interval, so no calibration constant is needed.
- *
- * The clock is rdtsc (~20 cycles), not QueryPerformanceCounter (~60 ns). Two
- * QPC calls per triangle is 1.6M a second, which added ~100 ms of GE time to
- * the very measurement it was taking -- a fifth of the number being read. A
- * profiler that changes the answer by 20% is not much use for deciding what to
- * optimise next. */
 unsigned long long g_prof_xform_tk, g_prof_gpu_tk;
-/* GPU submit-and-wait stalls, accumulated by ge_gpu_vk.c. Defined here so
- * the headless build (which has no Vulkan backend) still links. */
+unsigned long long g_prof_prim_tk, g_prof_tex_tk, g_prof_rback_tk;
 unsigned long long g_prof_wait_tk;
 unsigned long g_prof_wait_n;
 unsigned long g_prof_on;
@@ -425,27 +388,24 @@ static u64 prof_tk(void) {
 
 u64 ge_prof_now_tk(void) { return prof_tk(); }
 #define s_ge_ms_acc (g_ge_us_acc / 1000u)
-static unsigned long s_wall_last = 0;   /* wall ms at end of previous stat window */
-static int s_in3d = 0;   /* current raster path is transform-mode (for px2d/px3d split) */
-static int s_ashade = 0; /* per-window budget for alpha-test failure dumps (SR_GESTAT) */
-static int s_pixwho_n = 0; /* per-window budget for SR_PIXWHO pixel-ownership dumps */
-static int s_pxpass = 0; /* per-window budget for passing-3D-pixel dumps (SR_GESTAT) */
-static int s_pxc = 0;    /* per-window budget for centre-pixel write traces (SR_GESTAT) */
-static int s_neardump = 0; /* per-window budget for fully-near-clipped primitive dumps (SR_GESTAT) */
-static int s_ge3d = 0;     /* per-window budget for per-3D-draw GE3D lines (SR_GESTAT) */
-static uint32_t s_ge3d_sigs[48];  /* distinct draw signatures already printed this window */
+static unsigned long s_wall_last = 0;
+static int s_in3d = 0;
+static int s_ashade = 0;
+static int s_pixwho_n = 0;
+static int s_pxpass = 0;
+static int s_pxc = 0;
+static int s_neardump = 0;
+static int s_ge3d = 0;
+static uint32_t s_ge3d_sigs[48];
 
-/* SR_RTRACE=1: per-draw (TRIDRW) and per-triangle (TRIDEC) render trace for the first
- * SR_RTRACE_FRAMES (default 2) 3D frames of each stat window. */
-static int s_rtrace = -1;            /* env flag, lazy init */
-static int s_rt_fbudget = 2;         /* frames traced per window (SR_RTRACE_FRAMES) */
-static int s_rt_frames = 0;          /* frames traced so far this window */
+static int s_rtrace = -1;
+static int s_rt_fbudget = 2;
+static int s_rt_frames = 0;
 static uint32_t s_rt_cur_frame = 0xFFFFFFFFu;
-static int s_rt_active = 0;          /* tracing the current frame */
-static uint32_t s_rt_draw = 0;       /* global 3D draw sequence number */
-static int s_rt_draws_f = 0;         /* draws logged this frame (cap) */
+static int s_rt_active = 0;
+static uint32_t s_rt_draw = 0;
+static int s_rt_draws_f = 0;
 
-/* Per-texture alpha-test outcome counters for transform-mode fragments (SR_GESTAT). */
 #define ATEX_N 16
 static struct { uint32_t addr; unsigned long fail, pass; } s_atex[ATEX_N];
 static void atex_note(uint32_t addr, int pass) {
@@ -459,7 +419,6 @@ static void atex_note(uint32_t addr, int pass) {
 }
 static void stat_zfail(void) { s_stat.zfail++; }
 
-/* Through-mode primitives honour the depth test like the hardware; SR_NO2DZ=1 disables. */
 static int thru_ztest(void) {
     static int no2dz = -1;
     if (no2dz < 0) no2dz = getenv("SR_NO2DZ") ? 1 : 0;
@@ -474,7 +433,7 @@ void ge_set_frame(uint32_t frame) {
     if (s_stat_on && frame && (frame % 60) == 0) {
         unsigned long now = wall_ms();
         fprintf(stderr,
-            "GESTAT f=%u wall=%lums ge=%lums tri2d=%lu tri3d=%lu spr2d=%lu spr3d=%lu cull=%lu near=%lu zfail=%lu afail=%lu px2d=%lu px3d=%lu mw=%lu/%lu/%lu\n",
+            "GESTAT f=%u wall=%lums ge=%lums tri2d=%lu tri3d=%lu spr2d=%lu spr3d=%lu cull=%lu near=%lu zfail=%lu afail=%lu px2d=%lu px3d=%lu mw=%lu/%lu/%lu xform=%lu\n",
             frame, now - s_wall_last, s_ge_ms_acc,
             s_stat.tri2d, s_stat.tri3d, s_stat.spr2d, s_stat.spr3d,
             s_stat.cull, s_stat.nearclip, s_stat.zfail, s_stat.afail, s_stat.px2d, s_stat.px3d,
@@ -508,8 +467,6 @@ void ge_set_frame(uint32_t frame) {
         s_pixwho_n = 0;
         s_rt_frames = 0;
         memset(&s_stat, 0, sizeof(s_stat));
-        /* SR_FBSNAP=1: dump the GE framebuffer once per stat window (SR_FBSNAP=<n> caps
-         * files; default 40). */
         {
             static int fbsnap = -1; static int nsnap = 0;
             if (fbsnap < 0) {
@@ -531,7 +488,6 @@ static uint32_t texel_offset(uint32_t row_pitch_pixels, uint32_t u, uint32_t v, 
     if (!ge.tex_swizzle)
         return v * ((row_pitch_pixels * texel_bits) >> 3) + ((u * texel_bits) >> 3);
 
-    /* Swizzled offset, per PPSSPP. */
     const uint32_t tile_bits = 32, tiles_x = 4, tiles_y = 8;
     uint32_t texels_per_tile = tile_bits / texel_bits;
     uint32_t tile_u   = u / texels_per_tile;
@@ -552,17 +508,6 @@ static int tex_coord(int v, int size, int clamp_mode) {
     return v & (size - 1) & 511;
 }
 
-/* ---- DXT -----------------------------------------------------------------
- * PSP DXT block layout differs from DDS; measured against the reference
- * imgconv.exe output:
- *
- *   DXT1, 8 bytes:   [colour indices 4][c0 c1 4]
- *   DXT3, 16 bytes:  [colour indices 4][c0 c1 4][alpha 8]
- *   DXT5, 16 bytes:  [colour indices 4][c0 c1 4][alpha indices 6][a0 a1]
- *
- * Within each field the bit layout is standard S3TC. Blocks are 4x4, row of
- * blocks strided by bufw. */
-
 static uint32_t dxt_rgb565(uint32_t v) {
     uint32_t r = (v & 0x1F) << 3, g = ((v >> 5) & 0x3F) << 2, b = ((v >> 11) & 0x1F) << 3;
     r |= r >> 5; g |= g >> 6; b |= b >> 5;
@@ -578,7 +523,6 @@ static uint32_t dxt_mix(uint32_t a, uint32_t b, int wa, int wb, int div) {
     return out;
 }
 
-/* One DXT texel as 0xAABBGGRR. */
 static uint32_t dxt_texel(int s, int t) {
     uint32_t fmt = ge.tex_fmt;
     uint32_t bsz = (fmt == 8) ? 8u : 16u;
@@ -598,7 +542,7 @@ static uint32_t dxt_texel(int s, int t) {
     c1raw = MEM_R16(base + 6);
     pal[0] = dxt_rgb565(c0raw);
     pal[1] = dxt_rgb565(c1raw);
-    if (fmt == 8 && c0raw <= c1raw) {          /* 3-colour DXT1 variant */
+    if (fmt == 8 && c0raw <= c1raw) {
         pal[2] = dxt_mix(pal[0], pal[1], 1, 1, 2);
         pal[3] = 0u;
     } else {
@@ -608,11 +552,11 @@ static uint32_t dxt_texel(int s, int t) {
     sel = (idx >> ((iy*4u + ix) * 2u)) & 3u;
     colour = pal[sel];
 
-    if (fmt == 9) {                             /* DXT3: 4-bit alpha at +8 */
+    if (fmt == 9) {
         uint32_t n = iy*4u + ix;
         uint32_t byte = MEM_R8(base + 8u + (n >> 1));
         alpha = ((n & 1u) ? (byte >> 4) : (byte & 0xFu)) * 17u;
-    } else if (fmt == 10) {                     /* DXT5: 3-bit codes, a0/a1 at +14 */
+    } else if (fmt == 10) {
         uint32_t a0 = MEM_R8(base + 14), a1 = MEM_R8(base + 15);
         uint32_t n = iy*4u + ix, bit = n * 3u;
         uint64_t bits = (uint64_t)MEM_R32(base + 8) | ((uint64_t)MEM_R16(base + 12) << 32);
@@ -624,7 +568,7 @@ static uint32_t dxt_texel(int s, int t) {
         else if (code == 7) alpha = 255u;
         else                alpha = ((6u-code)*a0 + (code-1u)*a1) / 5u;
     }
-    if (fmt == 8 && colour == 0u) return 0u;    /* the transparent case */
+    if (fmt == 8 && colour == 0u) return 0u;
     return (colour & 0x00FFFFFFu) | ((alpha & 0xFFu) << 24);
 }
 
@@ -648,10 +592,9 @@ static void sample_tex(int tu, int tv, int *r, int *g, int *b, int *a) {
             clut_lookup((uint32_t)ni, r, g, b, a); break;
         }
         case 5: clut_lookup(MEM_R8(ge.tex_addr + texel_offset(stride, u, v, 8)), r, g, b, a); break;
-        /* IDTEX16/IDTEX32: the CLUT transform truncates wide indices to a real entry. */
         case 6: clut_lookup(MEM_R16(ge.tex_addr + texel_offset(stride, u, v, 16)), r, g, b, a); break;
         case 7: clut_lookup(MEM_R32(ge.tex_addr + texel_offset(stride, u, v, 32)), r, g, b, a); break;
-        case 8: case 9: case 10: {              /* DXT1/3/5 (grafted) */
+        case 8: case 9: case 10: {
             uint32_t px = dxt_texel((int)u, (int)v);
             *r = (int)(px & 0xFF); *g = (int)((px >> 8) & 0xFF);
             *b = (int)((px >> 16) & 0xFF); *a = (int)(px >> 24);
@@ -667,10 +610,6 @@ static void sample_tex_f(float fu, float fv_coord, int *r, int *g, int *b, int *
     static int nobil = -1; if (nobil < 0) nobil = getenv("SR_NOBILINEAR") ? 1 : 0;
     int use_linear = !nobil && ((ge.tex_filter & 1) || ((ge.tex_filter >> 8) & 1));
     if (!use_linear) { sample_tex((int)(fu + 0.5f), (int)(fv_coord + 0.5f), r, g, b, a); return; }
-    /* An integer texel coordinate is that texel's CENTRE -- the same convention
-     * the nearest branch above uses. Subtracting 0.5 here would put integers on
-     * texel boundaries instead, which makes every pixel of a 1:1 blit (all the
-     * HUD text) a 50/50 mix of two neighbouring texels. */
     int u0 = (int)floorf(fu), v0 = (int)floorf(fv_coord);
     int fx = (int)((fu - u0) * 256.0f), fy = (int)((fv_coord - v0) * 256.0f);
     if (fx < 0) fx = 0;
@@ -689,8 +628,6 @@ static void sample_tex_f(float fu, float fv_coord, int *r, int *g, int *b, int *
 #undef LERP1
 }
 
-/* SR_TEXDUMP=1: write each distinct 3D-draw texture once per run as .ppm (+alpha .pgm),
- * decoded through the exact sampler path. */
 static void texdump_maybe(void) {
     static int on = -1;
     if (on < 0) on = getenv("SR_TEXDUMP") ? 1 : 0;
@@ -724,8 +661,43 @@ static void texdump_maybe(void) {
             s_ge_frame, path, ge.clut_addr, ge.clut_fmt, ge.tex_swizzle, ge.tex_bufw, ge.tex_filter);
 }
 
-/* GPU backend texture decode via the exact sampler path above; linear direct-color
- * formats take a row-wise fast path. */
+static void ge_decode_tex_reference(uint32_t *out) {
+    for (int v = 0; v < ge.tex_h; v++)
+        for (int u = 0; u < ge.tex_w; u++) {
+            int r, g, b, a;
+            sample_tex(u, v, &r, &g, &b, &a);
+            out[v * ge.tex_w + u] = (uint32_t)(r & 0xFF) | ((uint32_t)(g & 0xFF) << 8) |
+                                    ((uint32_t)(b & 0xFF) << 16) | ((uint32_t)(a & 0xFF) << 24);
+        }
+}
+
+#define TEXVERIFY_SAMPLE_EVERY 16
+#define TEXVERIFY_REPORT_EVERY 64
+
+static void ge_decode_tex_verify(const uint32_t *fast) {
+    static int on = -1;
+    static uint32_t ref[512 * 512];
+    static unsigned long seen, checked, bad;
+    if (on < 0) on = getenv("SR_TEXVERIFY") ? 1 : 0;
+    if (!on) return;
+    if ((seen++ % TEXVERIFY_SAMPLE_EVERY) != 0) return;
+    ge_decode_tex_reference(ref);
+    checked++;
+    for (int i = 0; i < ge.tex_w * ge.tex_h; i++) {
+        if (ref[i] == fast[i]) continue;
+        bad++;
+        if (bad <= 8)
+            fprintf(stderr, "TEXVERIFY MISMATCH fmt=%u swz=%d %dx%d bufw=%u clutfmt=%06x "
+                    "i=%d ref=%08x fast=%08x\n",
+                    ge.tex_fmt, ge.tex_swizzle, ge.tex_w, ge.tex_h, ge.tex_bufw,
+                    ge.clut_fmt, i, ref[i], fast[i]);
+        break;
+    }
+    if ((checked % TEXVERIFY_REPORT_EVERY) == 0)
+        fprintf(stderr, "TEXVERIFY %lu of %lu decodes checked, %lu mismatched\n",
+                checked, seen, bad);
+}
+
 void ge_decode_tex_rgba(uint32_t *out) {
     if (!ge.tex_swizzle && ge.tex_fmt <= 3) {
         uint32_t stride = ge.tex_bufw ? ge.tex_bufw : (uint32_t)ge.tex_w;
@@ -745,13 +717,38 @@ void ge_decode_tex_rgba(uint32_t *out) {
         }
         return;
     }
-    for (int v = 0; v < ge.tex_h; v++)
-        for (int u = 0; u < ge.tex_w; u++) {
-            int r, g, b, a;
-            sample_tex(u, v, &r, &g, &b, &a);
-            out[v * ge.tex_w + u] = (uint32_t)(r & 0xFF) | ((uint32_t)(g & 0xFF) << 8) |
-                                    ((uint32_t)(b & 0xFF) << 16) | ((uint32_t)(a & 0xFF) << 24);
+    if (ge.tex_fmt == 4 || ge.tex_fmt == 5) {
+        uint32_t stride = ge.tex_bufw ? ge.tex_bufw : (uint32_t)ge.tex_w;
+        uint32_t bits = ge.tex_fmt == 4 ? 4u : 8u;
+        clut_table_build();
+        for (int v = 0; v < ge.tex_h; v++) {
+            uint32_t *dst = out + (uint32_t)v * (uint32_t)ge.tex_w;
+            if (!ge.tex_swizzle) {
+                const uint8_t *row =
+                    (const uint8_t *)SR_HOST(ge.tex_addr
+                                             + (uint32_t)v * ((stride * bits) >> 3));
+                if (bits == 8) {
+                    for (int u = 0; u < ge.tex_w; u++) dst[u] = s_clut_rgba[row[u]];
+                } else {
+                    for (int u = 0; u < ge.tex_w; u++) {
+                        uint8_t byte = row[(uint32_t)u >> 1];
+                        dst[u] = s_clut_rgba[(u & 1) ? (byte >> 4) : (byte & 0xFu)];
+                    }
+                }
+            } else {
+                for (int u = 0; u < ge.tex_w; u++) {
+                    uint32_t off = texel_offset(stride, (uint32_t)u, (uint32_t)v, bits);
+                    uint8_t byte = (uint8_t)MEM_R8(ge.tex_addr + off);
+                    dst[u] = s_clut_rgba[bits == 8 ? byte
+                                                   : ((u & 1) ? (byte >> 4)
+                                                              : (byte & 0xFu))];
+                }
+            }
         }
+        ge_decode_tex_verify(out);
+        return;
+    }
+    ge_decode_tex_reference(out);
 }
 
 static uint16_t pack565(int r, int g, int b)           { return (uint16_t)(((r>>3)&0x1F)|(((g>>2)&0x3F)<<5)|(((b>>3)&0x1F)<<11)); }
@@ -817,7 +814,6 @@ static void put_px_rgba(int x, int y, int r, int g, int b, int a) {
         fprintf(stderr, "PXPASS f=%u xy=(%d,%d) rgba=(%d,%d,%d,%d) fbp=0x%08x blend=%d/%06x\n",
                 s_ge_frame, x, y, r, g, b, a, ge.fbp, ge.blend_enable, ge.blend_mode);
     }
-    /* Centre-pixel composition trace: every write to (240,136), in order. */
     if (s_stat_on > 0 && x == 240 && y == 136 && s_pxc < 32) {
         s_pxc++;
         fprintf(stderr, "PXC f=%u rgba=(%d,%d,%d,%d) clear=%d in3d=%d tex=%d blend=%d/%06x fixab=%06x/%06x vtype=0x%06x fbp=0x%08x\n",
@@ -876,14 +872,12 @@ static void put_px_rgba(int x, int y, int r, int g, int b, int a) {
     if (ge.clear) g_list_clearpx++;
 }
 
-/* put_px_rgba with depth test. */
 static void put_px_rgba_z(int x, int y, uint16_t pz, int r, int g, int b, int a) {
     if (x<0||x>=480||y<0||y>=272) return;
     if (!ztest_px(x, y, pz)) return;
     put_px_rgba(x, y, r, g, b, a);
 }
 
-/* Rasterized vertex (GeVtx, ge_shared.h); in transform mode u/v are pre-multiplied by rw. */
 typedef GeVtx Vtx;
 
 static void load_vtx(uint32_t addr, const VFmt *vf, Vtx *o) {
@@ -907,7 +901,6 @@ static uint32_t prim_vtx_addr(uint32_t vbase, uint32_t ibase, int idxfmt, int i,
     return vbase + vi * (uint32_t)stride;
 }
 
-/* Programmable alpha test (ALPHATEST 0xDB: func | ref<<8 | mask<<16). */
 static int alpha_test(int a) {
     if (!ge.atest_enable) return 1;
     static int noatest = -1;
@@ -932,8 +925,6 @@ static int alpha_test(int a) {
     return pass;
 }
 
-/* Compute final pixel colour from interpolated texcoord+colour+fog.
- * `fog` is fixed-point 0..256 (256 = no fog). Returns 0 if the alpha test rejects. */
 static int shade(float u, float fv, int fog, int vr, int vg, int vb, int va, int *or_, int *og, int *ob, int *oa) {
     int r, g, b, a;
     int dbg_ta = -1;
@@ -944,24 +935,24 @@ static int shade(float u, float fv, int fog, int vr, int vg, int vb, int va, int
         sample_tex_f(u, fv, &tr, &tg, &tb, &ta);
         dbg_ta = ta;
         switch (ge.tex_func & 7) {
-            case 1: /* decal */
+            case 1:
                 if (rgba) {
                     int inva=255-ta, div=dbl?128:256;
                     r=((vr+1)*inva+(tr+1)*ta)/div; g=((vg+1)*inva+(tg+1)*ta)/div; b=((vb+1)*inva+(tb+1)*ta)/div;
                 } else { r=dbl?tr*2:tr; g=dbl?tg*2:tg; b=dbl?tb*2:tb; }
                 a=va; break;
-            case 2: { /* blend */
+            case 2: {
                 int er=ge.tex_env&0xFF, eg=(ge.tex_env>>8)&0xFF, eb=(ge.tex_env>>16)&0xFF, div=dbl?128:256;
                 r=((255-tr)*vr+tr*er+255)/div; g=((255-tg)*vg+tg*eg+255)/div; b=((255-tb)*vb+tb*eb+255)/div;
                 a=rgba?((va+1)*ta/256):va; break;
             }
-            case 3: /* replace */
+            case 3:
                 r=dbl?tr*2:tr; g=dbl?tg*2:tg; b=dbl?tb*2:tb; a=rgba?ta:va; break;
-            case 4: case 5: case 6: case 7: /* add */
+            case 4: case 5: case 6: case 7:
                 r=vr+tr; g=vg+tg; b=vb+tb;
                 if (dbl){r*=2;g*=2;b*=2;}
                 a=rgba?((va+1)*ta/256):va; break;
-            case 0: default: /* modulate */
+            case 0: default:
                 r=(vr+1)*(dbl?tr*2:tr)/256; g=(vg+1)*(dbl?tg*2:tg)/256; b=(vb+1)*(dbl?tb*2:tb)/256;
                 a=rgba?((va+1)*ta/256):va; break;
         }
@@ -973,7 +964,6 @@ static int shade(float u, float fv, int fog, int vr, int vg, int vb, int va, int
                 atex_note((ge.tex_enable && ge.tex_addr) ? ge.tex_addr : 0, 0);
             if (s_stat_on > 0 && s_in3d && s_ashade < 8) {
                 s_ashade++;
-                /* For CLUT formats also show the sampled index byte and raw palette entry. */
                 uint32_t rawidx = 0, rawpal = 0;
                 if (ge.tex_fmt == 4 || ge.tex_fmt == 5) {
                     uint32_t stride2 = ge.tex_bufw ? ge.tex_bufw : (uint32_t)ge.tex_w;
@@ -993,7 +983,6 @@ static int shade(float u, float fv, int fog, int vr, int vg, int vb, int va, int
                         ge.tex_w, ge.tex_h, ge.tex_bufw, ge.tex_swizzle, rawidx, rawpal,
                         ge.lighting_enable, ge.mat_update,
                         ge.material_alpha_set ? ge.material_alpha : -1, ge.amb_alpha);
-                /* Once per window: the first 16 CLUT entries and 16 raw texels. */
                 if (s_ashade == 1 && (ge.tex_fmt == 4 || ge.tex_fmt == 5)) {
                     fprintf(stderr, "ACLUT f=%u addr=0x%08x pal0..15=", s_ge_frame, ge.clut_addr);
                     for (int ci = 0; ci < 16; ci++) {
@@ -1013,7 +1002,7 @@ static int shade(float u, float fv, int fog, int vr, int vg, int vb, int va, int
             atex_note((ge.tex_enable && ge.tex_addr) ? ge.tex_addr : 0, 1);
             if (fog == 0) s_stat.fog0++; else if (fog >= 256) s_stat.fogfull++;
         }
-        if (fog < 256) {  /* mix toward fog colour; alpha unaffected */
+        if (fog < 256) {
             int fr=(int)(ge.fog_color&0xFF), fg=(int)((ge.fog_color>>8)&0xFF), fb=(int)((ge.fog_color>>16)&0xFF);
             r = fr + (((r - fr) * fog) >> 8);
             g = fg + (((g - fg) * fog) >> 8);
@@ -1024,11 +1013,6 @@ static int shade(float u, float fv, int fog, int vr, int vg, int vb, int va, int
     return 1;
 }
 
-/* ---- Unified triangle rasterizer ----
- * Incremental edge functions, bbox pre-clipped to screen and scissor.
- * persp=1 (transform-mode): culling, perspective-correct UV, depth test, fog.
- * persp=0 (through-mode): affine UV; depth test only if the list enabled it. */
-/* SR_PIXWHO=x,y probe pixel (shared by the triangle, sprite and clear paths). */
 static int s_who_x = -2, s_who_y = -2;
 static void who_init(void) {
     if (s_who_x != -2) return;
@@ -1038,8 +1022,6 @@ static void who_init(void) {
 }
 
 static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
-    /* GPU capture seam: if the backend declines it has already flushed, so the
-     * software path stays ordered against prior GPU work. */
     if (s_gpu && s_gpu->tri) {
         u64 gt0 = g_prof_on ? prof_tk() : 0;
         int done = s_gpu->tri(A, B, C, persp);
@@ -1050,9 +1032,6 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
     float area=(B->x-A->x)*(C->y-A->y)-(C->x-A->x)*(B->y-A->y);
     if (area == 0.0f) { if (persp) s_stat.deg3d++; return; }
 
-    /* Back-face culling (per PPSSPP): only triangles whose SUBMITTED order has positive
-     * cross product draw; the cull mode is realised by the caller's vertex order (see
-     * draw_prim). Applies in BOTH transform and through mode. */
     static int nocull = -1;
     if (nocull < 0) nocull = getenv("SR_NOCULL") ? 1 : 0;
     if (ge.cull_enable && !ge.clear && !nocull) {
@@ -1070,16 +1049,13 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
     if (maxy > cy2) maxy = cy2;
     if (minx > maxx || miny > maxy) return;
 
-    /* Coverage: exact integer edge functions on the PSP's 28.4 subpixel grid with a
-     * top-left fill rule, so each shared-edge pixel lands in exactly one triangle.
-     * Hardware rounding: (int)(x*16 + 0.375), per PPSSPP. */
     long long ax=(long long)floorf(A->x*16.0f+0.375f), ay=(long long)floorf(A->y*16.0f+0.375f);
     long long bx=(long long)floorf(B->x*16.0f+0.375f), by=(long long)floorf(B->y*16.0f+0.375f);
     long long cxx=(long long)floorf(C->x*16.0f+0.375f), cyy=(long long)floorf(C->y*16.0f+0.375f);
     long long area2 = (bx-ax)*(cyy-ay) - (cxx-ax)*(by-ay);
     if (area2 == 0) { if (persp) s_stat.deg3d++; return; }
     const Vtx *VA=A, *VB=B, *VC=C;
-    if (area2 < 0) {  /* normalise winding so the interior is the positive side */
+    if (area2 < 0) {
         const Vtx *t=VB; VB=VC; VC=t;
         long long tt; tt=bx; bx=cxx; cxx=tt; tt=by; by=cyy; cyy=tt;
         area2 = -area2;
@@ -1093,16 +1069,11 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
     int use_fog  = persp && ge.fog_enable && !ge.clear;
     s_in3d = persp;
 
-    /* Attribute deltas relative to VC: attr = VCattr + w0*(VA-VC) + w1*(VB-VC), recomputed
-     * per pixel from the integer weights (no incremental float drift). */
 #define AT_SETUP(n, f) float n##_ac=(VA->f)-(VC->f), n##_bc=(VB->f)-(VC->f)
 #define AT_PIX(n, f)   float n=(VC->f)+w0f*n##_ac+w1f*n##_bc
     AT_SETUP(iu, u); AT_SETUP(iv, v); AT_SETUP(irw, rw); AT_SETUP(iz, z); AT_SETUP(ifog, fog);
     AT_SETUP(ir, r); AT_SETUP(ig, g); AT_SETUP(ib, b); AT_SETUP(ia, a);
 
-    /* Edge functions at pixel centres: e0 along VA->VB (weights VC), e1 along VB->VC
-     * (weights VA), e2 along VC->VA (weights VB). Bias 0 keeps E==0 pixels only on
-     * top (dy==0, dx>0) and left (dy<0) edges. */
     long long dx0=bx-ax,  dy0=by-ay;
     long long dx1=cxx-bx, dy1=cyy-by;
     long long dx2=ax-cxx, dy2=ay-cyy;
@@ -1122,7 +1093,6 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
             AT_PIX(irw, rw); AT_PIX(iz, z); AT_PIX(ifog, fog);
             if (!zrange_ok(iz, persp)) { if (s_stat_on > 0) s_stat.zrange++; continue; }
 
-            /* Clear-mode triangles: depth (bit 10) writes unconditionally, no z-test. */
             if (ge.clear) {
                 if (ge.clear_mode & 0x400) {
                     uint32_t zi = (uint32_t)(y * (int)zbuf_stride() + x);
@@ -1158,14 +1128,12 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
             int sr,sg,sb,sa;
             if (!shade(u,fv,fog,r,g,b,a,&sr,&sg,&sb,&sa)) continue;
 
-            /* SR_PIXWHO=x,y: log every triangle that writes the chosen pixel. */
             {
                 who_init();
                 if (x == s_who_x && y == s_who_y && s_pixwho_n < 400) {
                     s_pixwho_n++;
                     uint32_t zidx = (uint32_t)(y * (int)zbuf_stride() + x);
                     unsigned curz = zidx < 272u*512u ? s_zbuf[zidx] : 99999u;
-                    /* zpass: the verdict the depth test will actually give this pixel. */
                     int zpass = 1;
                     if (use_z && zidx < 272u*512u) {
                         uint16_t zv = clamp_z(iz);
@@ -1199,9 +1167,13 @@ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
 #undef AT_PIX
 }
 
-/* Line rasterizer (DDA), used for prim types 1/2 in both modes. */
 static void draw_line_vtx(const Vtx *A, const Vtx *B, int persp) {
-    if (s_gpu && s_gpu->line && s_gpu->line(A, B, persp)) return;
+    if (s_gpu && s_gpu->line) {
+        u64 gt0 = g_prof_on ? prof_tk() : 0;
+        int done = s_gpu->line(A, B, persp);
+        if (g_prof_on) g_prof_gpu_tk += prof_tk() - gt0;
+        if (done) return;
+    }
     float dx=B->x-A->x, dy=B->y-A->y;
     float len=fmaxf(fabsf(dx),fabsf(dy));
     int steps=(int)len;
@@ -1237,7 +1209,12 @@ static void draw_line_vtx(const Vtx *A, const Vtx *B, int persp) {
 }
 
 static void draw_point_vtx(const Vtx *A, int persp) {
-    if (s_gpu && s_gpu->point && s_gpu->point(A, persp)) return;
+    if (s_gpu && s_gpu->point) {
+        u64 gt0 = g_prof_on ? prof_tk() : 0;
+        int done = s_gpu->point(A, persp);
+        if (g_prof_on) g_prof_gpu_tk += prof_tk() - gt0;
+        if (done) return;
+    }
     if (!zrange_ok(A->z, persp)) { if (s_stat_on > 0) s_stat.zrange++; return; }
     int textured = ge.tex_enable && !ge.clear && ge.tex_addr;
     float u=0, fv=0;
@@ -1254,23 +1231,18 @@ static void draw_point_vtx(const Vtx *A, int persp) {
     else       put_px_rgba((int)A->x,(int)A->y,sr,sg,sb,sa);
 }
 
-/* ---- 3D T&L pipeline ---- */
-
-/* Multiply 4×3 column-major matrix by vec3. Returns vec3. (World/View transforms) */
 static void mat43_mul(const float *m, float ix, float iy, float iz, float *ox, float *oy, float *oz) {
     *ox = m[0]*ix + m[3]*iy + m[6]*iz + m[9];
     *oy = m[1]*ix + m[4]*iy + m[7]*iz + m[10];
     *oz = m[2]*ix + m[5]*iy + m[8]*iz + m[11];
 }
 
-/* Rotate a vec3 by the upper 3×3 of a 4×3 matrix (no translation; for normals). */
 static void mat33_mul(const float *m, float ix, float iy, float iz, float *ox, float *oy, float *oz) {
     *ox = m[0]*ix + m[3]*iy + m[6]*iz;
     *oy = m[1]*ix + m[4]*iy + m[7]*iz;
     *oz = m[2]*ix + m[5]*iy + m[8]*iz;
 }
 
-/* Multiply 4×4 column-major matrix by vec3, returning vec4 (clip space). (Proj transform) */
 static void mat44_mul(const float *m, float ix, float iy, float iz, float *ox, float *oy, float *oz, float *ow) {
     *ox = m[0]*ix + m[4]*iy + m[8]*iz  + m[12];
     *oy = m[1]*ix + m[5]*iy + m[9]*iz  + m[13];
@@ -1280,15 +1252,9 @@ static void mat44_mul(const float *m, float ix, float iy, float iz, float *ox, f
 
 static float c8f(uint32_t col, int chan) { return (float)((col >> (chan*8)) & 0xFF) * (1.0f/255.0f); }
 
-/* Per-vertex lighting in world space: emissive + scene ambient, plus per-light
- * ambient/diffuse/specular for up to 4 directional/point lights (spot treated as point).
- * Material colours come from the registers or the vertex colour per MATERIALUPDATE bits. */
 static void light_vertex(float wx, float wy, float wz, float nx, float ny, float nz,
                          int vr, int vg, int vb, int va, int *lr, int *lg, int *lb, int *la) {
     float vrf = vr*(1.0f/255.0f), vgf = vg*(1.0f/255.0f), vbf = vb*(1.0f/255.0f);
-    /* Lit alpha = material-ambient alpha * scene-ambient alpha; diffuse/specular/emissive never
-     * contribute to alpha (PPSSPP Software/Lighting.cpp). With MATERIALUPDATE bit 0 the vertex
-     * colour (including its alpha) substitutes for the ambient material colour. */
     int maa = (ge.mat_update & 1) ? va : (ge.material_alpha_set ? ge.material_alpha : 255);
     *la = clamp8((maa * ge.amb_alpha + 127) / 255);
     float mar, mag, mab, mdr, mdg, mdb, msr, msg, msb;
@@ -1309,26 +1275,26 @@ static void light_vertex(float wx, float wy, float wz, float nx, float ny, float
         int type = (int)((ge.light_type[i] >> 8) & 3);
         float lx = ge.light_pos[i][0], ly = ge.light_pos[i][1], lz = ge.light_pos[i][2];
         float att = 1.0f;
-        if (type != 0) {  /* point/spot: light vector from vertex, distance attenuation */
+        if (type != 0) {
             lx -= wx; ly -= wy; lz -= wz;
             float d2 = lx*lx + ly*ly + lz*lz;
             float d = sqrtf(d2);
             float den = ge.light_att[i][0] + ge.light_att[i][1]*d + ge.light_att[i][2]*d2;
             att = den > 0.0f ? clampf01(1.0f/den) : 1.0f;
             if (d > 0.0f) { lx/=d; ly/=d; lz/=d; }
-        } else {          /* directional: position register holds the direction */
+        } else {
             float d = sqrtf(lx*lx + ly*ly + lz*lz);
             if (d > 0.0f) { lx/=d; ly/=d; lz/=d; }
         }
         float ndl = nx*lx + ny*ly + nz*lz;
         if (ndl < 0.0f) ndl = 0.0f;
-        if (comp == 2 && ge.spec_coef > 0.0f) ndl = powf(ndl, ge.spec_coef);   /* powered diffuse */
+        if (comp == 2 && ge.spec_coef > 0.0f) ndl = powf(ndl, ge.spec_coef);
 
         r += att*(c8f(ge.light_acol[i],0)*mar + c8f(ge.light_dcol[i],0)*mdr*ndl);
         g += att*(c8f(ge.light_acol[i],1)*mag + c8f(ge.light_dcol[i],1)*mdg*ndl);
         b += att*(c8f(ge.light_acol[i],2)*mab + c8f(ge.light_dcol[i],2)*mdb*ndl);
 
-        if ((comp & 1) && ndl > 0.0f) {  /* specular, Blinn half-vector with eye (0,0,1) */
+        if ((comp & 1) && ndl > 0.0f) {
             float hx=lx, hy=ly, hz=lz+1.0f;
             float hd = sqrtf(hx*hx + hy*hy + hz*hz);
             if (hd > 0.0f) {
@@ -1347,20 +1313,12 @@ static void light_vertex(float wx, float wy, float wz, float nx, float ny, float
     *lb = clamp8((int)(b*255.0f + 0.5f));
 }
 
-/* Clip-space vertex: position before the perspective divide plus raw (un-premultiplied)
- * texel UV and lit color, so near-plane clipping can interpolate linearly before
- * projecting. */
 typedef struct {
     float cx, cy, cz, cw; float u, v; float fog; int r, g, b, a;
-    /* PSP acceptance flags: oor = projected screen coords outside the GE's 4096-grid;
-     * ozp/ozn = z/w beyond +-1. */
     int oor, ozp, ozn;
-    /* Projected screen-grid coords (pre-offset) for SR_RTRACE logging; valid when cw != 0. */
     float sx, sy, sz;
 } CVtx;
 
-/* read_nrm + skinning blend: normals rotate through the bone matrices' 3x3 parts with
- * the same weights as positions. */
 static void read_nrm_skinned(uint32_t addr, const VFmt *vf, const float *w, int skinned,
                              float *x, float *y, float *z) {
     read_nrm(addr, vf, x, y, z);
@@ -1378,10 +1336,9 @@ static void read_nrm_skinned(uint32_t addr, const VFmt *vf, const float *w, int 
 static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
     float mx, my, mz;
     u64 prof_t0 = g_prof_on ? prof_tk() : 0;
-    s_stat.xform++;   /* against tri3d: the strip/fan cache's payoff */
+    s_stat.xform++;
     read_pos(addr, vf, &mx, &my, &mz);
 
-    /* Skinning: blend through up to 8 bone matrices, then apply the world matrix. */
     float skw[8];
     int skinned = (!vf->through && vf->w_n) ? 1 : 0;
     if (skinned) {
@@ -1396,29 +1353,22 @@ static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
         mx = px; my = py; mz = pz;
     }
 
-    /* World transform (model → world) */
     float wx, wy, wz;
     mat43_mul(ge.world, mx, my, mz, &wx, &wy, &wz);
 
-    /* View transform (world → camera) */
     float cx, cy, cz;
     mat43_mul(ge.view, wx, wy, wz, &cx, &cy, &cz);
 
-    /* Projection (camera → clip). The divisor is the real clip-space w from the proj
-     * matrix W row: perspective gives clipw == -cz, orthographic gives clipw == 1. */
     mat44_mul(ge.proj, cx, cy, cz, &o->cx, &o->cy, &o->cz, &o->cw);
 
-    /* Fog factor from view-space depth: 1 = no fog, 0 = full fog (PPSSPP convention);
-     * linear in cz. SR_NOFOG=1 disables. */
     static int nofog = -1;
     if (nofog < 0) nofog = getenv("SR_NOFOG") ? 1 : 0;
     if (ge.fog_enable && !nofog) {
-        /* Inf/NaN fog coefficients are VALID: they force a constant factor (per PPSSPP). */
         float fend = ge.fog_end, fslope = ge.fog_slope;
         if (isinf(fend) || isnan(fend)) {
             int sign = signbit(fend) ? 1 : 0;
-            if (signbit(fslope)) sign = !sign;   /* the multiply would flip it */
-            if (fslope == 0.0f) sign = 1;        /* *0 clamps to zero regardless of sign */
+            if (signbit(fslope)) sign = !sign;
+            if (fslope == 0.0f) sign = 1;
             o->fog = sign ? 0.0f : 1.0f;
         } else {
             if (isinf(fslope) || isnan(fslope))
@@ -1427,10 +1377,6 @@ static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
         }
     } else o->fog = 1.0f;
 
-    /* Texcoords. Mode 0: vertex UVs with TEXSCALE/TEXOFFSET. Mode 1: texgen matrix on a
-     * source picked by bits 8-9 (0=model pos, 1=vertex uv, 2=normalized normal, 3=raw
-     * normal); scale/offset NOT applied. Mode 2: envmap from two light directions.
-     * Result is in texel units; the 1/w premultiply happens at projection. */
     float u, fv;
     uint32_t tmm = ge.tex_map_mode & 3;
     if (tmm == 1) {
@@ -1449,11 +1395,10 @@ static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
         }
         float ts, tt, tq;
         mat43_mul(ge.tgen, sx, sy, sz2, &ts, &tt, &tq);
-        if (tq == 0.0f) tq = 1.0f;   /* affine texgen has q==... (z row unused) */
+        if (tq == 0.0f) tq = 1.0f;
         u  = (ts / tq) * (float)ge.tex_w;
         fv = (tt / tq) * (float)ge.tex_h;
     } else if (tmm == 2) {
-        /* env map: s/t = (1 + dot(normalize(lightpos[lsN]), worldnormal)) / 2 */
         float nx2, ny2, nz2, wnx2, wny2, wnz2;
         read_nrm_skinned(addr, vf, skw, skinned, &nx2, &ny2, &nz2);
         mat33_mul(ge.world, nx2, ny2, nz2, &wnx2, &wny2, &wnz2);
@@ -1478,7 +1423,6 @@ static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
     o->v = fv;
 
     read_color(addr, vf, &o->r, &o->g, &o->b, &o->a);
-
     static int nolight = -1;
     if (nolight < 0) nolight = getenv("SR_NOLIGHT") ? 1 : 0;
     if (ge.lighting_enable && !nolight) {
@@ -1491,8 +1435,6 @@ static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
         light_vertex(wx, wy, wz, wnx, wny, wnz, o->r, o->g, o->b, o->a, &o->r, &o->g, &o->b, &o->a);
     }
 
-    /* PSP acceptance flags (per PPSSPP): the hardware does NOT rasterise primitives whose
-     * vertices leave the valid screen grid or the z range. */
     o->oor = o->ozp = o->ozn = 0;
     {
         const float zoutside = 1.000030517578125f;
@@ -1513,10 +1455,8 @@ static void transform_vtx_clip(uint32_t addr, const VFmt *vf, CVtx *o) {
     if (g_prof_on) g_prof_xform_tk += prof_tk() - prof_t0;
 }
 
-/* Smallest clip-space w kept by the near clipper. */
 #define NEAR_W 1e-3f
 
-/* Perspective divide + viewport: clip-space vertex (cw > 0 required) → screen vertex. */
 static void project_cvtx(const CVtx *c, Vtx *o) {
     float inv_w = 1.0f / c->cw;
     float ndcx = c->cx * inv_w, ndcy = c->cy * inv_w, ndcz = c->cz * inv_w;
@@ -1534,20 +1474,17 @@ static void project_cvtx(const CVtx *c, Vtx *o) {
     o->y  = ndcy * vp_ys + vp_yc - off_y;
     float sz = ndcz * vp_zs + vp_zc;
     o->z  = sz < 0.0f ? 0.0f : sz > 65535.0f ? 65535.0f : sz;
-    o->rw = inv_w;          /* 1/clipw for perspective-correct UV interpolation */
+    o->rw = inv_w;
     o->u  = c->u * inv_w;
     o->v  = c->v * inv_w;
     o->fog = c->fog;
     o->r = c->r; o->g = c->g; o->b = c->b; o->a = c->a;
 }
 
-/* Compatibility wrapper for points/lines/sprites: reject behind-camera vertices. */
 static int transform_vtx_3d(uint32_t addr, const VFmt *vf, Vtx *o) {
     CVtx c;
     transform_vtx_clip(addr, vf, &c);
     if (c.cw <= NEAR_W) { s_stat.nearclip++; return 0; }
-    /* PSP point/sprite acceptance: out-of-range or out-of-z vertices are dropped whole
-     * (rects do not clip against any plane, per PPSSPP). */
     if (c.oor) { s_stat.nearclip++; return 0; }
     if (!ge.depth_clip && (c.ozp || c.ozn)) { s_stat.nearclip++; return 0; }
     project_cvtx(&c, o);
@@ -1566,18 +1503,14 @@ static void clip_lerp_cvtx(const CVtx *a, const CVtx *b, float t, CVtx *o) {
     o->g = a->g + (int)((float)(b->g - a->g) * t);
     o->b = a->b + (int)((float)(b->b - a->b) * t);
     o->a = a->a + (int)((float)(b->a - a->a) * t);
-    /* oor=2 marks a vertex CREATED by the near clip: it is re-projected and re-checked
-     * against the screen grid (clip_vtx_out_of_range below). */
     o->oor = 2; o->ozp = o->ozn = 0;
     o->sx = o->sy = o->sz = 0.0f;
 }
 
-/* A vertex produced by the near-z clip is re-projected; if its screen position leaves
- * the 4096 grid it poisons every sub-triangle that references it (per PPSSPP). */
 static int clip_vtx_out_of_range(CVtx *v) {
-    if (v->oor != 2) return 0;        /* original vertex: transform-time verdict already passed */
-    if (v->cw <= NEAR_W) return 1;    /* w ~ 0: projection blows up (PPSSPP gets inf coords) */
-    float sx = v->cx * decode_float24(ge.viewport_raw[0]) / v->cw + decode_float24(ge.viewport_raw[3]);
+    if (v->oor != 2) return 0;
+    if (v->cw <= NEAR_W) return 1;
+    float sx =v->cx * decode_float24(ge.viewport_raw[0]) / v->cw + decode_float24(ge.viewport_raw[3]);
     float sy = v->cy * decode_float24(ge.viewport_raw[1]) / v->cw + decode_float24(ge.viewport_raw[4]);
     float sz = v->cz * decode_float24(ge.viewport_raw[2]) / v->cw + decode_float24(ge.viewport_raw[5]);
     v->sx = sx; v->sy = sy; v->sz = sz;
@@ -1587,12 +1520,8 @@ static int clip_vtx_out_of_range(CVtx *v) {
     return sx > SB || sy >= SB || sx < 0.0f || sy < 0.0f || sz < 0.0f || sz >= 65536.0f;
 }
 
-/* Signed distance to the PSP's only clip plane: z >= -w. The PSP clips against negative
- * Z only, regardless of viewport (per PPSSPP). */
 static float clip_d_nearz(const CVtx *v) { return v->cz + v->cw; }
 
-/* Sutherland–Hodgman against z >= -w. in[] has n vertices (a triangle);
- * out[] receives up to n+1. Returns the clipped vertex count (0 if fully behind). */
 static int clip_poly_near(const CVtx *in, int n, CVtx *out) {
     int m = 0;
     for (int i = 0; i < n; i++) {
@@ -1611,8 +1540,6 @@ static int clip_poly_near(const CVtx *in, int n, CVtx *out) {
 static int s_gelog = -1;
 static int s_gewatch = -1, s_gewatch_after = -1, s_gewatch_limit = -1;
 
-/* SR_GEMAT=1: dump the T&L state and the first vertex's full pipeline for the first 16
- * transform-mode PRIMs. */
 static void dump_xform_debug(uint32_t vbase, uint32_t ibase, int idxfmt, const VFmt *vf,
                              int type, int count) {
     static int on = -1, n = 0;
@@ -1639,7 +1566,6 @@ static void dump_xform_debug(uint32_t vbase, uint32_t ibase, int idxfmt, const V
             mx,my,mz, wx,wy,wz, cx,cy,cz, X,Y,Z, W, W <= 0.0f ? "  << NEAR-REJECTED" : "");
 }
 
-/* Fast clear-mode rectangle fill: colour+alpha writes pack a constant value per row. */
 static void fill_rect_clear_fast(int xa, int ya, int xb, int yb, int r, int g, int b, int a) {
     int cx1 = ge.scis_x1 > 0 ? ge.scis_x1 : 0,   cy1 = ge.scis_y1 > 0 ? ge.scis_y1 : 0;
     int cx2 = ge.scis_x2 < 479 ? ge.scis_x2 : 479, cy2 = ge.scis_y2 < 271 ? ge.scis_y2 : 271;
@@ -1665,12 +1591,6 @@ static void fill_rect_clear_fast(int xa, int ya, int xb, int yb, int r, int g, i
     g_ge_pixels += (unsigned long)(xb - xa) * (unsigned long)(yb - ya);
 }
 
-/* Rasterise a sprite (axis-aligned rect from two corner vertices). Used by both modes;
- * persp=1 recovers UV from the over-w storage and depth-tests with the second vertex's z. */
-/* SR_SPRTRACE=<n>: dump the first n through-mode sprites of a frame with their
- * exact screen rect, texel rect and sampler state. Adjacent 2D sprites (text
- * runs, HUD panels) should tile with no gap and no overlap; this is what says
- * whether they do. Runs before the GPU hook, so it reports both renderers. */
 static void sprtrace(const Vtx *p0, const Vtx *p1, int persp) {
     static int budget = -1, seen;
     static uint32_t frame = 0xFFFFFFFFu;
@@ -1692,13 +1612,17 @@ static void sprtrace(const Vtx *p0, const Vtx *p1, int persp) {
 
 static void fill_sprite(const Vtx *p0, const Vtx *p1, int persp) {
     sprtrace(p0, p1, persp);
-    if (s_gpu && s_gpu->sprite && s_gpu->sprite(p0, p1, persp)) return;
+    if (s_gpu && s_gpu->sprite) {
+        u64 gt0 = g_prof_on ? prof_tk() : 0;
+        int done = s_gpu->sprite(p0, p1, persp);
+        if (g_prof_on) g_prof_gpu_tk += prof_tk() - gt0;
+        if (done) return;
+    }
 
     int xa=(int)fminf(p0->x,p1->x), xb=(int)fmaxf(p0->x,p1->x);
     int ya=(int)fminf(p0->y,p1->y), yb=(int)fmaxf(p0->y,p1->y);
 
     if (ge.clear) {
-        /* Clear-mode: bit 10 clears depth (to the sprite's z), bits 8/9 colour/alpha. */
         if (ge.clear_mode & 0x400)
             zbuf_fill_rect(xa, ya, xb - 1, yb - 1, (uint16_t)p1->z);
         who_init();
@@ -1716,17 +1640,12 @@ static void fill_sprite(const Vtx *p0, const Vtx *p1, int persp) {
     }
 
     float u0=p0->u, v0=p0->v, u1=p1->u, v1=p1->v;
-    if (persp) {  /* UV stored over w; recover texel coords */
+    if (persp) {
         u0 = p0->u / (p0->rw != 0.0f ? p0->rw : 1.0f);
         v0 = p0->v / (p0->rw != 0.0f ? p0->rw : 1.0f);
         u1 = p1->u / (p1->rw != 0.0f ? p1->rw : 1.0f);
         v1 = p1->v / (p1->rw != 0.0f ? p1->rw : 1.0f);
     }
-    /* A sprite's two vertices are opposite corners AS GIVEN: v0's texel coords
-     * belong to v0's corner, whichever side of the rect that is. Handing the
-     * corners over in reverse is how the GE flips a sprite (the ring quadrants
-     * of the HUD reticle, mirrored UI tiles). xa/xb above sort the rect, so the
-     * texel coords have to follow the same sort or the flip is lost. */
     int flipx = p0->x > p1->x, flipy = p0->y > p1->y;
     if (flipx) { float t = u0; u0 = u1; u1 = t; }
     if (flipy) { float t = v0; v0 = v1; v1 = t; }
@@ -1738,11 +1657,6 @@ static void fill_sprite(const Vtx *p0, const Vtx *p1, int persp) {
     if (persp) s_stat.spr3d++; else s_stat.spr2d++;
     float uw =(xb>xa)?(u1-u0)/(float)(xb-xa):0;
     float uvv=(yb>ya)?(v1-v0)/(float)(yb-ya):0;
-    /* The run is half-open, so the corner texel lands on the FIRST pixel and
-     * the far corner's texel is one step past the last. Mirrored, that anchor
-     * moves to the far edge: without the step the outermost texel column never
-     * gets sampled, which is exactly where a quarter-arc tile runs tangent --
-     * the reticle ring lost a chunk at its +x and +y extremes. */
     if (flipx) u0 += uw;
     if (flipy) v0 += uvv;
     for (int y=ya; y<yb; y++) {
@@ -1757,8 +1671,6 @@ static void fill_sprite(const Vtx *p0, const Vtx *p1, int persp) {
     }
 }
 
-/* Dump state when an entire 3D primitive lands behind the near plane (SR_GESTAT,
- * budgeted per stat window). */
 static void near_dump(const char *what, uint32_t a0, const VFmt *vf, const CVtx *cv, int n) {
     if (s_stat_on <= 0 || s_neardump >= 3) return;
     s_neardump++;
@@ -1795,18 +1707,16 @@ static void draw_prim(uint32_t op) {
                 type, count, ge.vtype, vf.through, idxfmt, ge.tex_enable, ge.tex_fmt, ge.fbp, ge.vaddr, ge.iaddr, nthrough, ntransform);
     }
     uint32_t vbase = ge.vaddr, ibase = ge.iaddr;
-    /* Advance vertex/index pointer (PPSSPP GPUCommon::AdvanceVerts). */
     if (idxfmt) ge.iaddr += (uint32_t)(count << (idxfmt - 1));
     else        ge.vaddr += (uint32_t)(count * vf.stride);
 
-    /* ---- THROUGH-MODE (2D, screen coords) ---- */
     if (vf.through) {
-        if (type == 0) {           /* points */
+        if (type == 0) {
             for (int i = 0; i < count; i++) {
                 Vtx a; load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i,vf.stride),&vf,&a);
                 draw_point_vtx(&a, 0);
             }
-        } else if (type == 1 || type == 2) {   /* lines / line strip */
+        } else if (type == 1 || type == 2) {
             for (int i = 1; i < count; i++) {
                 if (type == 1 && (i & 1) == 0) continue;
                 Vtx a, b;
@@ -1824,15 +1734,13 @@ static void draw_prim(uint32_t op) {
                 load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i0,vf.stride),&vf,&a);
                 load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i1,vf.stride),&vf,&b);
                 load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i2,vf.stride),&vf,&c);
-                /* Same submission-order culling as transform mode (the GE culls in
-                 * through mode too); strips alternate, provoking vertex stays last. */
                 if (ge.cull_enable && !ge.clear) {
                     int flip = ((ge.cull & 1) == 0) ^ ((type == 4) ? (i & 1) : 0);
                     if (flip) { Vtx t = a; a = b; b = t; }
                 }
                 raster_tri(&a,&b,&c,0);
             }
-        } else if (type == 6) {   /* sprites */
+        } else if (type == 6) {
             for (int i = 1; i < count; i += 2) {
                 Vtx p0, p1;
                 load_vtx(prim_vtx_addr(vbase,ibase,idxfmt,i-1,vf.stride),&vf,&p0);
@@ -1862,7 +1770,6 @@ static void draw_prim(uint32_t op) {
         return;
     }
 
-    /* ---- TRANSFORM-MODE (3D, full T&L) ---- */
     dump_xform_debug(vbase, ibase, idxfmt, &vf, type, count);
     if (s_rtrace < 0) {
         s_rtrace = getenv("SR_RTRACE") ? 1 : 0;
@@ -1887,8 +1794,7 @@ static void draw_prim(uint32_t op) {
     }
     s_rt_draw++;
     texdump_maybe();
-    if (s_stat_on > 0 && ((ge.vtype >> 9) & 3)) s_stat.skin++;   /* weighted (count field is n-1) */
-    /* One line per DISTINCT transform-mode draw signature per stat window. */
+    if (s_stat_on > 0 && ((ge.vtype >> 9) & 3)) s_stat.skin++;
     if (s_stat_on > 0 && s_ge3d < 48) {
         uint32_t sig = (uint32_t)type ^ ((uint32_t)count << 3) ^ (ge.vtype << 13) ^ ge.tex_addr ^ (ge.tex_enable ? 0x80000000u : 0);
         int seen = 0;
@@ -1916,14 +1822,11 @@ static void draw_prim(uint32_t op) {
                 s_ge_frame,type,count,ge.vtype,idxfmt,vbase,ibase);
     }
 
-    /* SR_VDUMP=1: dump raw vertex bytes and decoded attributes for the first 2
-     * transform-mode draws of each distinct vtype. */
     {
         static int vdump = -1;
         if (vdump < 0) vdump = getenv("SR_VDUMP") ? 1 : 0;
         if (vdump) {
             static uint32_t seen_vt[16]; static int seen_n[16]; static int seen_cnt = 0;
-            /* Re-arm once per stat window so later scenes get dumps too. */
             static uint32_t vd_win = 0;
             if (s_ge_frame / 60 != vd_win) {
                 vd_win = s_ge_frame / 60;
@@ -1964,20 +1867,19 @@ static void draw_prim(uint32_t op) {
         }
     }
 
-    if (type == 0) {           /* points */
+    if (type == 0) {
         for (int i = 0; i < count; i++) {
             Vtx a;
             if (!transform_vtx_3d(prim_vtx_addr(vbase,ibase,idxfmt,i,vf.stride),&vf,&a)) continue;
             draw_point_vtx(&a, 1);
         }
-    } else if (type == 1 || type == 2) {   /* lines / line strip */
+    } else if (type == 1 || type == 2) {
         if (s_stat_on > 0) s_stat.line3d += (unsigned long)(count > 0 ? count - 1 : 0);
         for (int i = 1; i < count; i++) {
             if (type == 1 && (i & 1) == 0) continue;
             CVtx ca, cb;
             transform_vtx_clip(prim_vtx_addr(vbase,ibase,idxfmt,i-1,vf.stride),&vf,&ca);
             transform_vtx_clip(prim_vtx_addr(vbase,ibase,idxfmt,i,  vf.stride),&vf,&cb);
-            /* PSP line acceptance (PPSSPP Clipper::ProcessLine): same drop rules as triangles. */
             if (ca.oor || cb.oor) { s_stat.nearclip++; continue; }
             if (ca.cw < 0.0f && cb.cw < 0.0f) { s_stat.nearclip++; continue; }
             if (!ge.depth_clip && (ca.ozp + ca.ozn + cb.ozp + cb.ozn) > 0) { s_stat.nearclip++; continue; }
@@ -1992,14 +1894,12 @@ static void draw_prim(uint32_t op) {
             if (da < 0.0f)       { CVtx t; clip_lerp_cvtx(&ca,&cb, da/(da-db2), &t); ca=t; }
             else if (db2 < 0.0f) { CVtx t; clip_lerp_cvtx(&cb,&ca, db2/(db2-da), &t); cb=t; }
             if (ca.cw <= NEAR_W || cb.cw <= NEAR_W) { s_stat.nearclip++; continue; }
-            /* PPSSPP ProcessLine: clip-created endpoints outside the screen grid kill the line. */
             if (clip_vtx_out_of_range(&ca) || clip_vtx_out_of_range(&cb)) { s_stat.nearclip++; continue; }
             Vtx a, b;
             project_cvtx(&ca,&a); project_cvtx(&cb,&b);
             draw_line_vtx(&a,&b,1);
         }
     } else if (type == 3 || type == 4 || type == 5) {
-        /* SR_RTRACE per-draw bookkeeping for the TRIDRW+ summary line. */
         enum { D_DRAW, D_OOR, D_WNEG, D_ZOUT, D_ZSAME, D_NEARALL, D_CWLOW, D_CLIP };
         static const char *dec_name[8] =
             { "DRAW", "drop-oor", "drop-wneg", "drop-zout", "drop-zsame", "drop-nearall", "drop-cwlow", "CLIP" };
@@ -2029,16 +1929,6 @@ static void draw_prim(uint32_t op) {
                     roffx, roffy, ge.scis_x1, ge.scis_y1, ge.scis_x2, ge.scis_y2,
                     ge.world[9], ge.world[10], ge.world[11], ge.view[9], ge.view[10], ge.view[11]);
         }
-        /* Consecutive triangles in a strip share two vertices, and every triangle in
-         * a fan shares the pivot, so transforming three vertices per triangle does
-         * the same work up to three times over. The transform is the expensive part
-         * of a frame here -- the GPU hook sits inside raster_tri, well after this --
-         * so carry the shared results forward instead of recomputing them.
-         *
-         * The snapshot is taken BEFORE the culling swap below, which reorders cv[]
-         * in place. Everything after that only reads it: clip_poly_near, clip_d_nearz
-         * and project_cvtx all take const CVtx *. Triangle lists (type 3) share
-         * nothing and are left alone. */
         CVtx keep_a, keep_b, fan_pivot;
         int have_keep = 0, have_pivot = 0;
 
@@ -2048,10 +1938,10 @@ static void draw_prim(uint32_t op) {
             else if (type == 4) { i0=i-2; i1=i-1; i2=i; }
             else                { i0=0;   i1=i-1; i2=i; }
             CVtx cv[3], cl[4];
-            if (type == 4 && have_keep) {          /* strip: i-2 and i-1 are last go's */
+            if (type == 4 && have_keep) {
                 cv[0] = keep_a;
                 cv[1] = keep_b;
-            } else if (type == 5) {                /* fan: pivot, then last go's i-1 */
+            } else if (type == 5) {
                 if (!have_pivot) {
                     transform_vtx_clip(prim_vtx_addr(vbase,ibase,idxfmt,i0,vf.stride),&vf,&fan_pivot);
                     have_pivot = 1;
@@ -2066,18 +1956,11 @@ static void draw_prim(uint32_t op) {
             transform_vtx_clip(prim_vtx_addr(vbase,ibase,idxfmt,i2,vf.stride),&vf,&cv[2]);
             if (type == 4 || type == 5) { keep_a = cv[1]; keep_b = cv[2]; have_keep = 1; }
 
-            /* Culling via submission order (per PPSSPP): the rasterizer keeps only
-             * positive-winding triangles, so cull mode 0 reverses the order, and STRIPS
-             * flip it again on every other triangle (strip winding alternates). The last
-             * vertex (provoking, used for flat shading) stays in place. */
             if (ge.cull_enable && !ge.clear) {
                 int flip = ((ge.cull & 1) == 0) ^ ((type == 4) ? (i & 1) : 0);
                 if (flip) { CVtx t = cv[0]; cv[0] = cv[1]; cv[1] = t; }
             }
 
-            /* PSP triangle acceptance (per PPSSPP): the hardware DROPS whole triangles
-             * rather than clipping when vertices leave the screen grid or the z range;
-             * games rely on it. */
             int dec = D_DRAW;
             if (cv[0].oor || cv[1].oor || cv[2].oor) dec = D_OOR;
             else if (cv[0].cw < 0.0f && cv[1].cw < 0.0f && cv[2].cw < 0.0f) dec = D_WNEG;
@@ -2093,14 +1976,12 @@ static void draw_prim(uint32_t op) {
                 } else if (clip_d_nearz(&cv[0]) < 0.0f && clip_d_nearz(&cv[1]) < 0.0f && clip_d_nearz(&cv[2]) < 0.0f) {
                     dec = D_NEARALL;
                 } else {
-                    dec = D_CLIP;   /* crosses the z >= -w plane: clip and fan */
+                    dec = D_CLIP;
                 }
             }
             dcnt[dec]++;
             if (dec != D_DRAW) s_stat.nearclip++;
 
-            /* TRIDEC: per-triangle decision log. First 12 per draw, plus every triangle
-             * whose bbox covers the SR_PIXWHO probe pixel. */
             if (rt) {
                 int probe = 0;
                 if (s_who_x >= 0) {
@@ -2141,8 +2022,6 @@ static void draw_prim(uint32_t op) {
             } else if (dec == D_CLIP) {
                 int m = clip_poly_near(cv, 3, cl);
                 if (m >= 3) {
-                    /* Sub-triangles containing an out-of-range clip-created vertex are
-                     * discarded; the rest of the fan still draws (per PPSSPP). */
                     Vtx p[4];
                     int bad[4];
                     for (int k = 0; k < m && k < 4; k++) {
@@ -2180,8 +2059,6 @@ static void draw_prim(uint32_t op) {
                     s_stat.zrange - st0.zrange, s_stat.blk3d - st0.blk3d);
         }
     } else if (type == 6) {
-        /* Sprites in transform mode: two 3D corner vertices define an axis-aligned screen
-         * rect; depth comes from the second vertex. */
         for (int i = 1; i < count; i += 2) {
             Vtx p0, p1;
             if (!transform_vtx_3d(prim_vtx_addr(vbase,ibase,idxfmt,i-1,vf.stride),&vf,&p0)) continue;
@@ -2191,7 +2068,6 @@ static void draw_prim(uint32_t op) {
     }
 }
 
-/* Unconditional framebuffer snapshot (no "best frame" gating) for SR_FBSNAP. */
 static void ge_snapshot_plain(const char *path) {
     uint32_t fb = ge_fb_addr(), stride = ge.fbw ? ge.fbw : 512;
     FILE *f = fopen(path, "wb");
@@ -2240,15 +2116,7 @@ static void ge_note_unhandled_cmd(uint32_t cmd, uint32_t op) {
 }
 
 unsigned long g_ge_list_sig=0, g_ge_prim_count=0;
-/* Per-list write accounting for SR_GEWATCH. */
 unsigned long g_list_writes=0, g_list_nonblack=0, g_list_clearpx=0;
-
-/* ---- F4 overlay overrides -------------------------------------------------
- * The settings the player edits are GE state changes, so they are applied to
- * the live state for the duration of one primitive and put back afterwards:
- * the game keeps owning the state (a knob returned to "game" restores exactly
- * what the list asked for), and both the software rasterizer and the GPU
- * backend see the same picture because both read `ge`. */
 
 typedef struct {
     int      fog_enable, lighting_enable, cull_enable, atest_enable;
@@ -2264,14 +2132,9 @@ static int ovr_tri(int mode, int game_value) {
 
 extern unsigned long g_ge_state_gen;
 
-/* Returns 0 when the whole primitive is to be dropped. */
 static int overrides_begin(StateSave *s, int prim_type) {
     const GfxSettings *g = &g_gfx;
 
-    /* These write ge.* directly rather than through ge_state_command, so the
-     * generation has to move here too or the GPU backend's state cache could
-     * serve a pre-override snapshot. Two increments per primitive is nothing;
-     * the cache's real win is the triangles inside one. */
     g_ge_state_gen++;
 
     if (g->skip_lines && (prim_type == 1 || prim_type == 2)) return 0;
@@ -2300,23 +2163,15 @@ static int overrides_begin(StateSave *s, int prim_type) {
     ge.ztest_enable    = ovr_tri(g->depth_test, ge.ztest_enable);
     ge.blend_enable    = ovr_tri(g->blending,   ge.blend_enable);
     ge.tex_enable      = ovr_tri(g->texturing,  ge.tex_enable);
-    /* zwrite_disable is inverted: "depth write off" means set the disable. */
     if (g->depth_write == OVR_OFF)     ge.zwrite_disable = 1;
     else if (g->depth_write == OVR_ON) ge.zwrite_disable = 0;
 
     if (g->shading == SHADE_FLAT)         ge.shade_gouraud = 0;
     else if (g->shading == SHADE_GOURAUD) ge.shade_gouraud = 1;
 
-    /* TEXFILTER: bits 0-2 minification, bits 8-9 magnification; 0 = nearest,
-     * 1 = linear (the mipmap variants are never sampled here). */
     if (g->tex_filter == TEXF_LINEAR)       ge.tex_filter = 0x0101u;
     else if (g->tex_filter == TEXF_NEAREST) ge.tex_filter = 0x0000u;
 
-    /* Fog in the engine's own terms. It stores a (near, far) pair and hands
-     * the GE end = far, slope = 1/(far - near) (engine guest 0x089e3ac4), so
-     * recovering near lets the two sliders mean what they say: move the far
-     * plane without dragging the haze start along, and vice versa. Scaling
-     * end and slope directly cannot express that. */
     if (ge.fog_enable
         && (g->fog_distance != 1.0f || g->fog_start != 1.0f)) {
         float band = (ge.fog_slope != 0.0f && isfinite(ge.fog_slope))
@@ -2324,8 +2179,6 @@ static int overrides_begin(StateSave *s, int prim_type) {
         if (isfinite(ge.fog_end) && band > 0.0f) {
             float far_ = ge.fog_end * g->fog_distance;
             float near_ = (ge.fog_end - band) * g->fog_start;
-            /* Keep the band non-degenerate: a zero or negative span would
-             * make the slope infinite and fog the whole scene. */
             if (far_ - near_ < 1e-3f) near_ = far_ - 1e-3f;
             ge.fog_end = far_;
             ge.fog_slope = 1.0f / (far_ - near_);
@@ -2359,35 +2212,27 @@ static void overrides_end(const StateSave *s) {
     ge.fog_color       = s->fog_color;
 }
 
-/* PRIM entry point: runtime/hle/ge.c walks the list and calls this for every
- * SCE_GE_CMD_PRIM word. */
 void ge_draw_prim(u8 *ram, u32 op) {
-    /* No timing call here. This runs ~3200 times a frame; clock() twice per
-     * primitive cost ~390k calls a second for a millisecond-resolution number
-     * that cannot resolve a single primitive anyway. GE time is measured once
-     * per list instead -- see ge_time_us in runtime/hle/ge.c. */
     StateSave save;
     VFmt vf;
+    u64 prim_t0 = g_prof_on ? prof_tk() : 0;
     s_ram = ram;
     if (!s_ge_inited) ge_state_init();
     decode_vtype(ge.vtype, &vf);
     if (!overrides_begin(&save, (int)((op >> 16) & 7))) {
-        /* Dropped, but the vertex/index cursor still has to advance or the
-         * next primitive in the list reads the wrong vertices. */
         int count = (int)(op & 0xFFFF);
         int idxfmt = (int)((ge.vtype >> 11) & 3);
         if (idxfmt) ge.iaddr += (uint32_t)(count << (idxfmt - 1));
         else        ge.vaddr += (uint32_t)(count * vf.stride);
+        if (g_prof_on) g_prof_prim_tk += prof_tk() - prim_t0;
         return;
     }
     draw_prim(op);
     overrides_end(&save);
+    if (g_prof_on) g_prof_prim_tk += prof_tk() - prim_t0;
     g_ge_prim_count++;
 }
 
-/* GE block transfer: rectangle copy between guest buffers (decode masks per PPSSPP).
- * With a GPU backend, flush("xfersrc") writes GPU targets back first and the written
- * range is dirty-notified afterwards. */
 static void ge_block_transfer(uint32_t startdata) {
     uint32_t srcBase = (ge.xf_src & 0xFFFFF0u) | ((ge.xf_srcw & 0xFF0000u) << 8);
     uint32_t dstBase = (ge.xf_dst & 0xFFFFF0u) | ((ge.xf_dstw & 0xFF0000u) << 8);
@@ -2398,7 +2243,8 @@ static void ge_block_transfer(uint32_t startdata) {
     uint32_t w = (ge.xf_size & 0x3FFu) + 1, h = ((ge.xf_size >> 10) & 0x3FFu) + 1;
     uint32_t bpp = (startdata & 1) ? 4 : 2;
     if (!srcStride || !dstStride) return;
-    if (s_gpu && s_gpu->xfer && s_gpu->xfer(startdata)) return;   /* GPU-side blit */
+    ge.xf_bpp = bpp;
+    if (s_gpu && s_gpu->xfer && s_gpu->xfer(startdata)) return;
     if (s_gpu && s_gpu->flush) s_gpu->flush("xfersrc");
     for (uint32_t y = 0; y < h; y++) {
         uint32_t so = srcBase + ((srcY + y) * srcStride + srcX) * bpp;
@@ -2409,12 +2255,6 @@ static void ge_block_transfer(uint32_t startdata) {
                       ((h - 1) * dstStride + w) * bpp);
 }
 
-/* State entry point: runtime/hle/ge.c owns list control flow and hands every other word
- * here. `base` is the executor's tracked BASE in (bits 27..24 << 24) form. Returns 1
- * when the command was consumed, 0 when it is not modelled. */
-/* Bumped by every GE state write. The GPU backend uses it to skip snapshotting
- * and comparing the whole GE state per triangle: no command executes while a
- * primitive's triangles are emitted, so they all share one state. */
 unsigned long g_ge_state_gen = 1;
 
 int ge_state_command(u8 *ram, u32 op, u32 base) {
@@ -2425,13 +2265,11 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
     {
         uint32_t cmd=op>>24, data=op&0xFFFFFF;
         switch (cmd) {
-            case GE_NOP: case 0xFF: break;   /* 0xFF = GE_CMD_NOP_FF (padding, PPSSPP) */
+            case GE_NOP: case 0xFF: break;
             case GE_VADDR:    ge.vaddr=ge_rel_addr(data); break;
             case GE_IADDR:    ge.iaddr=ge_rel_addr(data); break;
-            case GE_BASE:     break;         /* the list executor tracks BASE */
+            case GE_BASE:     break;
             case GE_OFFSETADDR: ge.offset=data<<8; break;
-            /* ORIGIN makes later relative addresses list-PC-relative; the PC lives in
-             * the executor, which does not forward it. Unused by this title. */
             case GE_ORIGIN:   ge.offset=0; break;
             case GE_VERTEXTYPE: ge.vtype=data; break;
 
@@ -2446,13 +2284,11 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
             case GE_ZBUFPTR:   ge.zbp=(ge.zbp&0xFF000000)|data; break;
             case GE_ZBUFWIDTH: ge.zbw=data&0xFFFF; ge.zbp=(ge.zbp&0x00FFFFFF)|((data&0xFF0000)<<8); break;
 
-            /* Drawing region: the scissor (which the game also sets) bounds all writes. */
             case GE_REGION1: case GE_REGION2: break;
 
             case GE_SCISSOR1: ge.scis_x1=data&0x3FF; ge.scis_y1=(data>>10)&0x3FF; break;
             case GE_SCISSOR2: ge.scis_x2=data&0x3FF; ge.scis_y2=(data>>10)&0x3FF; break;
 
-            /* ---- Depth / cull state ---- */
             case GE_ZTESTENABLE:   ge.ztest_enable  = data & 1; break;
             case GE_ZWRITEDISABLE: ge.zwrite_disable= data & 1; break;
             case GE_ZTEST:         ge.ztest         = data & 7; break;
@@ -2462,7 +2298,6 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
             case GE_CULL:          ge.cull          = data & 1; break;
             case GE_CLIPENABLE:    ge.depth_clip = data & 1; break;
 
-            /* ---- Fragment test / blend toggles ---- */
             case GE_ALPHATESTENABLE: ge.atest_enable = data & 1; break;
             case GE_ALPHATEST:       ge.atest        = data; break;
             case GE_ALPHABLENDENABLE: ge.blend_enable=data&1; break;
@@ -2472,7 +2307,6 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
             case GE_FOGCOLOR:   ge.fog_color = data; break;
             case GE_DITHERENABLE: ge.dither_enable = data & 1; break;
             case GE_DITH0: case GE_DITH1: case GE_DITH2: case GE_DITH3: {
-                /* One row of the 4x4 dither matrix: 4 signed 4-bit values. */
                 int row = (int)(cmd - GE_DITH0);
                 for (int i = 0; i < 4; i++) {
                     int v = (int)((data >> (i*4)) & 0xF);
@@ -2482,27 +2316,17 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
             }
             case GE_MASKRGB:   ge.mask_rgb   = data; break;
             case GE_MASKALPHA: ge.mask_alpha = (int)(data & 0xFF); break;
-            /* Stencil lives in destination alpha on the PSP; not emulated. Logic ops and
-             * colour test are rare and also skipped (state consumed so lists stay quiet). */
             case GE_STENCILTESTENABLE: case GE_STENCILTEST: case GE_STENCILOP: break;
             case GE_ANTIALIASENABLE: case GE_PATCHCULLENABLE: break;
             case GE_COLORTESTENABLE: case GE_LOGICOPENABLE: break;
             case GE_PATCHDIVISION: case GE_PATCHPRIMITIVE: case GE_PATCHFACING: break;
 
-            /* ---- Matrix capture ----
-             * *MATRIXNUMBER sets the write cursor; *MATRIXDATA writes one float24 and
-             * advances. World/View are 4×3 (12 elements), Proj is 4×4 (16). */
-            /* Bone matrices: 8 4x3 matrices in one 96-float array; NUMBER takes data&0x7F,
-             * DATA writes land only while < 96. */
-            case 0x2A: ge.bone_num = (int)(data & 0x7F); break;    /* BONEMATRIXNUMBER */
-            case 0x2B:                                             /* BONEMATRIXDATA */
+            case GE_BONEMATRIXNUMBER: ge.bone_num = (int)(data & 0x7F); break;
+            case GE_BONEMATRIXDATA:
                 if (s_stat_on > 0) s_stat.bonew++;
                 if (ge.bone_num < 96) ge.bone[ge.bone_num] = decode_float24(data);
                 ge.bone_num++;
                 break;
-            /* NUMBER takes the low 4 bits; DATA advances the cursor unconditionally but
-             * excess words are DISCARDED, never wrapped (per PPSSPP; a wrapped 13th word
-             * must not clobber element 0). */
             case GE_WORLDMATRIXNUMBER: ge.world_num = (int)(data & 0xF); break;
             case GE_WORLDMATRIXDATA:
                 s_stat.mw_world++;
@@ -2524,7 +2348,6 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
                 ge.proj_num++;
                 break;
 
-            /* ---- Viewport / offset ---- */
             case GE_VIEWPORTXSCALE:  ge.viewport_raw[0]=data; break;
             case GE_VIEWPORTYSCALE:  ge.viewport_raw[1]=data; break;
             case GE_VIEWPORTZSCALE:  ge.viewport_raw[2]=data; break;
@@ -2534,14 +2357,12 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
             case GE_OFFSETX:         ge.offsetx=data; break;
             case GE_OFFSETY:         ge.offsety=data; break;
 
-            /* ---- Shading / material / lighting ---- */
             case GE_SHADEMODE:       ge.shade_gouraud = data & 1; break;
             case GE_REVERSENORMAL:   ge.reverse_normal = data & 1; break;
             case GE_MATERIALUPDATE:  ge.mat_update = data & 7; break;
             case GE_MATERIALEMISSIVE:ge.mat_emissive = data; break;
             case GE_MATERIALAMBIENT: ge.material=data; ge.material_set=1; break;
             case GE_MATERIALDIFFUSE: ge.mat_diffuse=data;
-                /* Flat-colour fallback for colourless vertices also tracks diffuse. */
                 ge.material=data; ge.material_set=1; break;
             case GE_MATERIALSPECULAR:ge.mat_specular = data; break;
             case GE_MATERIALALPHA:   ge.material_alpha=data&0xFF; ge.material_alpha_set=1; break;
@@ -2585,12 +2406,10 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
                 break;
             }
 
-            /* ---- Texturing ---- */
             case GE_TEXTUREMAPENABLE: ge.tex_enable=data&1; break;
             case GE_TEXADDR0:     ge.tex_addr=(ge.tex_addr&0xFF000000)|(data&0x00FFFFFF); break;
             case GE_TEXBUFWIDTH0: ge.tex_bufw=data&0xFFFF; ge.tex_addr=(ge.tex_addr&0x00FFFFFF)|((data&0xFF0000)<<8); break;
             case GE_TEXSIZE0:  ge.tex_w=1<<(data&0xF); ge.tex_h=1<<((data>>8)&0xF); break;
-            /* Mip levels 1-7 (addr/bufwidth/size): only level 0 is sampled. */
             case GE_TEXADDR0+1: case GE_TEXADDR0+2: case GE_TEXADDR0+3: case GE_TEXADDR0+4:
             case GE_TEXADDR0+5: case GE_TEXADDR0+6: case GE_TEXADDR0+7:
             case GE_TEXBUFWIDTH0+1: case GE_TEXBUFWIDTH0+2: case GE_TEXBUFWIDTH0+3:
@@ -2615,11 +2434,9 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
                 if (ge.tgen_num < 12) ge.tgen[ge.tgen_num] = decode_float24(data);
                 ge.tgen_num++;
                 break;
-            case GE_TEXLEVEL: case GE_TEXLODSLOPE: break;     /* mipmaps not sampled */
-            case GE_TEXFLUSH: case GE_TEXSYNC: break;         /* no texture cache to flush */
+            case GE_TEXLEVEL: case GE_TEXLODSLOPE: break;
+            case GE_TEXFLUSH: case GE_TEXSYNC: break;
             case GE_LOADCLUT: {
-                /* Copy (data&0x3F) 32-byte blocks from clut_addr into internal CLUT RAM,
-                 * like the hardware. VRAM-sourced CLUTs need a GPU write-back first. */
                 if (s_gpu && s_gpu->flush && (ge.clut_addr & 0x0F000000u) == 0x04000000u)
                     s_gpu->flush("loadclut");
                 uint32_t bytes = (data & 0x3F) * 32;
@@ -2640,7 +2457,6 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
             case GE_BLENDFIXEDB: ge.blend_fixb=data; break;
             case GE_CLEARMODE:  ge.clear_mode=data; ge.clear=data&1; break;
 
-            /* ---- Block transfer ---- */
             case GE_TRANSFERSRC:    ge.xf_src  = data; break;
             case GE_TRANSFERSRCW:   ge.xf_srcw = data; break;
             case GE_TRANSFERDST:    ge.xf_dst  = data; break;
@@ -2650,7 +2466,6 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
             case GE_TRANSFERSIZE:   ge.xf_size = data; break;
             case GE_TRANSFERSTART:  ge_block_transfer(data); break;
 
-            /* Control flow never arrives here; the bounding-box test is not kept. */
             case GE_BJUMP: case GE_BOUNDINGBOX: break;
             default:
                 ge_note_unhandled_cmd(cmd, op);
@@ -2662,12 +2477,8 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
 
 uint32_t ge_framebuffer(void) { return ge_fb_addr(); }
 
-/* ---- pspreco API around the ported core -------------------------------- */
-
 u32 ge_framebuffer_addr(void) { return ge_fb_addr(); }
 
-/* 0xAABBGGRR from a raw frame-buffer pixel; the frame dump and the window
- * share this, so they cannot disagree about a format. */
 u32 ge_unpack_pixel(int fpf, u32 v)
 {
     int r, g, b, a;
@@ -2693,7 +2504,6 @@ void ge_raster_report(void)
            g_tex_samples, g_tex_nonzero);
 }
 
-/* What the current render target holds, on demand. PSPRECO_GE_PROBE=1. */
 void ge_raster_probe(u8 *ram, const char *when)
 {
     static int checked, on;
@@ -2718,11 +2528,6 @@ void ge_raster_probe(u8 *ram, const char *when)
            when, ge_fb_addr(), n);
 }
 
-/* ---- self-test ----------------------------------------------------------
- * Drives the ported rasteriser directly with known state and vertices and
- * checks the bytes it wrote, including the software depth buffer. Run with
- * `pspreco --selftest`; verify.py gates on it. */
-
 static void st_cmd(u8 *ram, u32 word) { ge_state_command(ram, word, 0); }
 
 static void st_vaddr(u8 *ram, u32 vbuf)
@@ -2742,12 +2547,12 @@ static int st_expect(u8 *ram, u32 addr, u32 want, const char *what)
 static void st_target(u8 *ram, u32 fb)
 {
     ge_raster_init();
-    st_cmd(ram, (0x9Cu << 24) | (fb & 0x00FFFFFFu));       /* FBP           */
-    st_cmd(ram, (0x9Du << 24) | 512u);                     /* FBW           */
-    st_cmd(ram, (0xD2u << 24) | 3u);                       /* FPF 8888      */
-    st_cmd(ram, (0x9Fu << 24) | 512u);                     /* ZBW           */
-    st_cmd(ram, (0xD4u << 24));                            /* scissor 0,0   */
-    st_cmd(ram, (0xD5u << 24) | (271u << 10) | 479u);      /* ..479,271     */
+    st_cmd(ram, (GE_FRAMEBUFPTR << 24) | (fb & 0x00FFFFFFu));
+    st_cmd(ram, (GE_FRAMEBUFWIDTH << 24) | 512u);
+    st_cmd(ram, (GE_FRAMEBUFPIXFORMAT << 24) | 3u);
+    st_cmd(ram, (GE_ZBUFWIDTH << 24) | 512u);
+    st_cmd(ram, (GE_SCISSOR1 << 24));
+    st_cmd(ram, (GE_SCISSOR2 << 24) | (271u << 10) | 479u);
 }
 
 static void st_identity(u8 *ram)
@@ -2755,21 +2560,20 @@ static void st_identity(u8 *ram)
     static const float i43[12] = { 1,0,0, 0,1,0, 0,0,1, 0,0,0 };
     static const float i44[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
     int i;
-    st_cmd(ram, (0x3Au << 24));
-    for (i = 0; i < 12; i++) st_cmd(ram, (0x3Bu << 24) | (f2u(i43[i]) >> 8));
-    st_cmd(ram, (0x3Cu << 24));
-    for (i = 0; i < 12; i++) st_cmd(ram, (0x3Du << 24) | (f2u(i43[i]) >> 8));
-    st_cmd(ram, (0x3Eu << 24));
-    for (i = 0; i < 16; i++) st_cmd(ram, (0x3Fu << 24) | (f2u(i44[i]) >> 8));
-    st_cmd(ram, (0x42u << 24) | (f2u(240.0f) >> 8));       /* VP XS */
-    st_cmd(ram, (0x43u << 24) | (f2u(136.0f) >> 8));       /* VP YS */
-    st_cmd(ram, (0x44u << 24) | (f2u(32767.5f) >> 8));     /* VP ZS */
-    st_cmd(ram, (0x45u << 24) | (f2u(240.0f) >> 8));       /* VP XC */
-    st_cmd(ram, (0x46u << 24) | (f2u(136.0f) >> 8));       /* VP YC */
-    st_cmd(ram, (0x47u << 24) | (f2u(32767.5f) >> 8));     /* VP ZC */
+    st_cmd(ram, (GE_WORLDMATRIXNUMBER << 24));
+    for (i = 0; i < 12; i++) st_cmd(ram, (GE_WORLDMATRIXDATA << 24) | (f2u(i43[i]) >> 8));
+    st_cmd(ram, (GE_VIEWMATRIXNUMBER << 24));
+    for (i = 0; i < 12; i++) st_cmd(ram, (GE_VIEWMATRIXDATA << 24) | (f2u(i43[i]) >> 8));
+    st_cmd(ram, (GE_PROJMATRIXNUMBER << 24));
+    for (i = 0; i < 16; i++) st_cmd(ram, (GE_PROJMATRIXDATA << 24) | (f2u(i44[i]) >> 8));
+    st_cmd(ram, (GE_VIEWPORTXSCALE << 24) | (f2u(240.0f) >> 8));
+    st_cmd(ram, (GE_VIEWPORTYSCALE << 24) | (f2u(136.0f) >> 8));
+    st_cmd(ram, (GE_VIEWPORTZSCALE << 24) | (f2u(32767.5f) >> 8));
+    st_cmd(ram, (GE_VIEWPORTXCENTER << 24) | (f2u(240.0f) >> 8));
+    st_cmd(ram, (GE_VIEWPORTYCENTER << 24) | (f2u(136.0f) >> 8));
+    st_cmd(ram, (GE_VIEWPORTZCENTER << 24) | (f2u(32767.5f) >> 8));
 }
 
-/* Through-mode vertex: 8888 colour then s16 x,y,z (+pad to 4-byte stride). */
 static void st_vtx2d(u8 *ram, u32 at, u32 colour, int x, int y, int z)
 {
     mem_w32(ram, at + 0, colour);
@@ -2787,9 +2591,13 @@ static void st_vtx3d(u8 *ram, u32 at, u32 colour, float x, float y, float z)
     mem_w32(ram, at + 12, f2u(z));
 }
 
-#define ST_VT2D ((1u << 23) | (2u << 7) | (7u << 2))   /* thru, s16 pos, 8888 */
-#define ST_VT3D ((3u << 7) | (7u << 2))                /* float pos, 8888     */
-#define ST_PRIM(kind, n) ((0x04u << 24) | ((u32)(kind) << 16) | (u32)(n))
+#define ST_VT2D ((1u << 23) | (2u << 7) | (7u << 2))
+#define ST_VT3D ((3u << 7) | (7u << 2))
+#define ST_PRIM(kind, n) ((GE_PRIM << 24) | ((u32)(kind) << 16) | (u32)(n))
+#define ST_PRIM_SPRITES 6
+#define ST_PRIM_TRIANGLES 3
+#define ST_PRIM_STRIP 4
+#define ST_PRIM_FAN 5
 
 static int st_through(u8 *ram, u32 fb)
 {
@@ -2797,11 +2605,11 @@ static int st_through(u8 *ram, u32 fb)
     int fails = 0;
 
     st_target(ram, fb);
-    st_cmd(ram, (0x12u << 24) | ST_VT2D);
+    st_cmd(ram, (GE_VERTEXTYPE << 24) | ST_VT2D);
     st_vtx2d(ram, vb + 0,  0xFF0000FFu, 4, 4, 0);
     st_vtx2d(ram, vb + 12, 0xFF0000FFu, 14, 14, 0);
     st_vaddr(ram, vb);
-    ge_draw_prim(ram, ST_PRIM(6, 2));                  /* sprite */
+    ge_draw_prim(ram, ST_PRIM(ST_PRIM_SPRITES, 2));
 
     fails += st_expect(ram, fb + (4u*512u + 4u)*4u, 0xFF0000FFu,
                        "through sprite top-left");
@@ -2812,12 +2620,11 @@ static int st_through(u8 *ram, u32 fb)
     fails += st_expect(ram, fb + (3u*512u + 3u)*4u, 0u,
                        "outside the through sprite");
 
-    /* The scissor bounds it. */
-    st_cmd(ram, (0xD5u << 24) | (7u << 10) | 7u);
+    st_cmd(ram, (GE_SCISSOR2 << 24) | (7u << 10) | 7u);
     st_vtx2d(ram, vb + 0,  0xFF00FF00u, 4, 4, 0);
     st_vtx2d(ram, vb + 12, 0xFF00FF00u, 14, 14, 0);
     st_vaddr(ram, vb);
-    ge_draw_prim(ram, ST_PRIM(6, 2));
+    ge_draw_prim(ram, ST_PRIM(ST_PRIM_SPRITES, 2));
     fails += st_expect(ram, fb + (5u*512u + 5u)*4u, 0xFF00FF00u,
                        "inside the scissor");
     fails += st_expect(ram, fb + (9u*512u + 9u)*4u, 0xFF0000FFu,
@@ -2834,12 +2641,12 @@ static int st_transform(u8 *ram, u32 fb)
 
     st_target(ram, fb);
     st_identity(ram);
-    st_cmd(ram, (0x12u << 24) | ST_VT3D);
+    st_cmd(ram, (GE_VERTEXTYPE << 24) | ST_VT3D);
     st_vtx3d(ram, vb + 0,  red,   -0.5f, -0.5f, 0.0f);
     st_vtx3d(ram, vb + 16, green,  0.5f, -0.5f, 0.0f);
     st_vtx3d(ram, vb + 32, blue,   0.0f,  0.5f, 0.0f);
     st_vaddr(ram, vb);
-    ge_draw_prim(ram, ST_PRIM(3, 3));                  /* triangles */
+    ge_draw_prim(ram, ST_PRIM(ST_PRIM_TRIANGLES, 3));
 
     mid = mem_r32(ram, fb + (150u*512u + 240u)*4u);
     if (!(mid & 0x00FFFFFFu)) {
@@ -2857,79 +2664,63 @@ static int st_transform(u8 *ram, u32 fb)
         }
     }
 
-    /* Back-face culling is by submission order: enable it and submit the
-     * reversed order; the triangle must vanish. */
     memset(ram + (fb & PSP_ADDR_MASK), 0, 512u * 272u * 4u);
     st_target(ram, fb);
     st_identity(ram);
-    st_cmd(ram, (0x12u << 24) | ST_VT3D);
-    st_cmd(ram, (0x1Du << 24) | 1u);                   /* CULLFACEENABLE */
-    st_cmd(ram, (0x9Bu << 24) | 1u);                   /* CULL = 1       */
+    st_cmd(ram, (GE_VERTEXTYPE << 24) | ST_VT3D);
+    st_cmd(ram, (GE_CULLFACEENABLE << 24) | 1u);
+    st_cmd(ram, (GE_CULL << 24) | 1u);
     st_vtx3d(ram, vb + 0,  red,    0.5f, -0.5f, 0.0f);
     st_vtx3d(ram, vb + 16, green, -0.5f, -0.5f, 0.0f);
     st_vtx3d(ram, vb + 32, blue,   0.0f,  0.5f, 0.0f);
     st_vaddr(ram, vb);
-    ge_draw_prim(ram, ST_PRIM(3, 3));
+    ge_draw_prim(ram, ST_PRIM(ST_PRIM_TRIANGLES, 3));
     fails += st_expect(ram, fb + (150u*512u + 240u)*4u, 0u,
                        "back-facing triangle is culled");
     return fails;
 }
 
-/* Strips and fans reuse transformed vertices between triangles (see the vertex
- * cache in ge_draw_prim). The cache must be invisible: drawing geometry as a
- * strip or a fan has to produce exactly what the equivalent list produces, and
- * a stale carried vertex would show up as a wrong or missing triangle. So draw
- * both and compare the framebuffers pixel for pixel.
- *
- * This exists because the rest of the self-test only ever submits type 3, which
- * is the one path the cache does not touch -- it would have passed unchanged
- * with the cache completely broken. */
 static int st_strip_fan(u8 *ram, u32 fb)
 {
     const u32 vb = 0x08530000u;
-    const u32 shadow = 0x08540000u;      /* copy of the list-drawn frame */
-    const u32 c0 = 0xFF0000FFu, c1 = 0xFF00FF00u, c2 = 0xFFFF0000u, c3 = 0xFFFFFF00u;
+    const u32 shadow = 0x08540000u;
+    const u32 c0 =0xFF0000FFu, c1 = 0xFF00FF00u, c2 = 0xFFFF0000u, c3 = 0xFFFFFF00u;
     const size_t bytes = 512u * 272u * 4u;
     int fails = 0;
 
-    /* Four vertices -> two triangles. As a strip that is (0,1,2) and (1,2,3);
-     * as a fan, (0,1,2) and (0,2,3). Both are expressed as explicit lists to
-     * compare against, with the strip's odd-triangle winding flip written out. */
     struct { float x, y, z; u32 c; } v[4] = {
         { -0.6f, -0.5f, 0.0f, c0 },
         {  0.5f, -0.6f, 0.0f, c1 },
         { -0.5f,  0.5f, 0.0f, c2 },
         {  0.6f,  0.45f, 0.0f, c3 },
     };
-    int strip_list[6] = { 0,1,2, 2,1,3 };   /* strip triangle 1 has flipped winding */
+    int strip_list[6] = { 0,1,2, 2,1,3 };
     int fan_list[6]   = { 0,1,2, 0,2,3 };
     int pass;
 
-    for (pass = 0; pass < 2; pass++) {     /* 0 = strip, 1 = fan */
+    for (pass = 0; pass < 2; pass++) {
         const int *ref = pass ? fan_list : strip_list;
         int i;
 
-        /* Reference: the same triangles as an explicit list. */
         memset(ram + (fb & PSP_ADDR_MASK), 0, bytes);
         st_target(ram, fb);
         st_identity(ram);
-        st_cmd(ram, (0x12u << 24) | ST_VT3D);
+        st_cmd(ram, (GE_VERTEXTYPE << 24) | ST_VT3D);
         for (i = 0; i < 6; i++)
             st_vtx3d(ram, vb + (u32)i * 16u, v[ref[i]].c,
                      v[ref[i]].x, v[ref[i]].y, v[ref[i]].z);
         st_vaddr(ram, vb);
-        ge_draw_prim(ram, ST_PRIM(3, 6));
+        ge_draw_prim(ram, ST_PRIM(ST_PRIM_TRIANGLES, 6));
         memcpy(ram + (shadow & PSP_ADDR_MASK), ram + (fb & PSP_ADDR_MASK), bytes);
 
-        /* Same geometry through the cached path. */
         memset(ram + (fb & PSP_ADDR_MASK), 0, bytes);
         st_target(ram, fb);
         st_identity(ram);
-        st_cmd(ram, (0x12u << 24) | ST_VT3D);
+        st_cmd(ram, (GE_VERTEXTYPE << 24) | ST_VT3D);
         for (i = 0; i < 4; i++)
             st_vtx3d(ram, vb + (u32)i * 16u, v[i].c, v[i].x, v[i].y, v[i].z);
         st_vaddr(ram, vb);
-        ge_draw_prim(ram, ST_PRIM(pass ? 5 : 4, 4));
+        ge_draw_prim(ram, ST_PRIM(pass ? ST_PRIM_FAN : ST_PRIM_STRIP, 4));
 
         if (memcmp(ram + (fb & PSP_ADDR_MASK),
                    ram + (shadow & PSP_ADDR_MASK), bytes) != 0) {
@@ -2945,19 +2736,17 @@ static int st_strip_fan(u8 *ram, u32 fb)
         }
     }
 
-    /* A long strip is where the cache actually earns its keep, and where a
-     * carried-forward vertex would drift: check one draws something at all. */
     memset(ram + (fb & PSP_ADDR_MASK), 0, bytes);
     st_target(ram, fb);
     st_identity(ram);
-    st_cmd(ram, (0x12u << 24) | ST_VT3D);
+    st_cmd(ram, (GE_VERTEXTYPE << 24) | ST_VT3D);
     {
         int i;
         for (i = 0; i < 8; i++)
             st_vtx3d(ram, vb + (u32)i * 16u, (i & 1) ? c1 : c2,
                      -0.7f + 0.2f * (float)i, (i & 1) ? 0.4f : -0.4f, 0.0f);
         st_vaddr(ram, vb);
-        ge_draw_prim(ram, ST_PRIM(4, 8));
+        ge_draw_prim(ram, ST_PRIM(ST_PRIM_STRIP, 8));
     }
     {
         u32 mid = mem_r32(ram, fb + (136u*512u + 240u)*4u);
@@ -2978,15 +2767,15 @@ static int st_depth(u8 *ram, u32 fb)
 
     st_target(ram, fb);
     zs = ge_zbuf_stride();
-    st_cmd(ram, (0x23u << 24) | 1u);                   /* ZTESTENABLE */
-    st_cmd(ram, (0xDEu << 24) | 4u);                   /* ZTEST LESS  */
+    st_cmd(ram, (GE_ZTESTENABLE << 24) | 1u);
+    st_cmd(ram, (GE_ZTEST << 24) | 4u);
     zb[20u * zs + 20u] = 100;
 
-    st_cmd(ram, (0x12u << 24) | ST_VT2D);
+    st_cmd(ram, (GE_VERTEXTYPE << 24) | ST_VT2D);
     st_vtx2d(ram, vb + 0,  0xFF0000FFu, 20, 20, 50);
     st_vtx2d(ram, vb + 12, 0xFF0000FFu, 21, 21, 50);
     st_vaddr(ram, vb);
-    ge_draw_prim(ram, ST_PRIM(6, 2));
+    ge_draw_prim(ram, ST_PRIM(ST_PRIM_SPRITES, 2));
     fails += st_expect(ram, fb + (20u*512u + 20u)*4u, 0xFF0000FFu,
                        "the nearer fragment passes the depth test");
     if (zb[20u * zs + 20u] != 50) {
@@ -2998,7 +2787,7 @@ static int st_depth(u8 *ram, u32 fb)
     st_vtx2d(ram, vb + 0,  0xFF00FF00u, 20, 20, 200);
     st_vtx2d(ram, vb + 12, 0xFF00FF00u, 21, 21, 200);
     st_vaddr(ram, vb);
-    ge_draw_prim(ram, ST_PRIM(6, 2));
+    ge_draw_prim(ram, ST_PRIM(ST_PRIM_SPRITES, 2));
     fails += st_expect(ram, fb + (20u*512u + 20u)*4u, 0xFF0000FFu,
                        "the farther fragment fails the depth test");
     return fails;
@@ -3016,14 +2805,13 @@ static int st_clear(u8 *ram, u32 fb)
     mem_w32(ram, fb + (30u*512u + 30u)*4u, 0xFF123456u);
     zb[30u * zs + 30u] = 4242;
 
-    /* CLEAR with only the depth enable (bit 10): colour survives, z does not. */
-    st_cmd(ram, (0xD3u << 24) | 1u | (1u << 10));
-    st_cmd(ram, (0x12u << 24) | ST_VT2D);
+    st_cmd(ram, (GE_CLEARMODE << 24) | 1u | (1u << 10));
+    st_cmd(ram, (GE_VERTEXTYPE << 24) | ST_VT2D);
     st_vtx2d(ram, vb + 0,  0xFFFFFFFFu, 30, 30, 7);
     st_vtx2d(ram, vb + 12, 0xFFFFFFFFu, 32, 32, 7);
     st_vaddr(ram, vb);
-    ge_draw_prim(ram, ST_PRIM(6, 2));
-    st_cmd(ram, (0xD3u << 24));
+    ge_draw_prim(ram, ST_PRIM(ST_PRIM_SPRITES, 2));
+    st_cmd(ram, (GE_CLEARMODE << 24));
 
     fails += st_expect(ram, fb + (30u*512u + 30u)*4u, 0xFF123456u,
                        "a depth-only clear leaves the colour alone");

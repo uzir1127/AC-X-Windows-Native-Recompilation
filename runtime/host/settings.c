@@ -1,9 +1,3 @@
-/* runtime/host/settings.c -- defaults, presets and TOML persistence.
- *
- * One field table drives saving, loading and clamping, so adding a setting
- * means adding a struct field and one row here.
- */
-
 #include "settings.h"
 #include "../hle/qol_input.h"
 
@@ -18,16 +12,12 @@ unsigned    g_gfx_generation = 1;
 void gfx_settings_touch(void)
 {
     g_gfx_generation++;
-    /* Push the input settings across to the layer that uses them.  Done here
-     * because every change -- defaults, file load, preset, menu -- funnels
-     * through this one function, and doing it here keeps runtime/hle from
-     * depending on host settings just to read five integers. */
     g_qol.rstick_cam    = g_gfx.rstick_cam;
     g_qol.rstick_invert = g_gfx.rstick_invert;
     g_qol.rstick_sens   = g_gfx.rstick_sens;
     g_qol.analog_yaw    = g_gfx.analog_yaw;
     g_qol.r3_view       = g_gfx.r3_view;
-    qol_input_init();   /* SR_QOL_OFF overrides the menu, so it goes last */
+    qol_input_init();
 }
 
 typedef enum { T_BOOL, T_INT, T_FLOAT, T_RGB } FType;
@@ -130,12 +120,6 @@ void gfx_settings_defaults(void)
     g_gfx.window_scale   = 2;
     g_gfx.aspect_mode    = ASPECT_KEEP;
     g_gfx.present_filter = 1;
-    /* Mailbox, not FIFO. We do our own frame pacing (pace_frame holds each
-     * emulated vblank to 59.94 Hz), so all vsync adds is its quantisation: miss
-     * a refresh deadline by a microsecond under FIFO and you wait a whole extra
-     * refresh, which turns "just under target" into a stable fraction of it.
-     * Mailbox has no tearing either and does not quantise. The swapchain falls
-     * back to FIFO where the driver lacks it. */
     g_gfx.present_mode   = PRESENT_MAILBOX;
     g_gfx.throttle       = 1;
     g_gfx.speed_percent  = 100;
@@ -148,18 +132,12 @@ void gfx_settings_defaults(void)
     g_gfx.contrast       = 1.0f;
     g_gfx.saturation     = 1.0f;
     g_gfx.gamma          = 1.0f;
-    /* The extra controls are on by default: a pad has a right stick and the
-     * engine has always had the code for it. */
     g_gfx.rstick_cam     = 1;
     g_gfx.rstick_sens    = 100;
     g_gfx.analog_yaw     = 1;
     g_gfx.r3_view        = 1;
     gfx_settings_touch();
 }
-
-/* ---- presets -------------------------------------------------------------
- * Only the visual fields move; window size, pacing preference and the debug
- * switches are the player's, not the preset's. */
 
 const char *gfx_preset_name(int preset)
 {
@@ -178,24 +156,15 @@ typedef struct {
     int fog, lighting, dither, shading;
 } Preset;
 
-/* What actually costs time here: the vertex transform, lighting and fog run
- * on the CPU in ge_render.c, and res_scale multiplies GPU fill. So Ultra
- * spends on supersampling and leaves every GE feature the game asked for
- * alone; Low drops the CPU-side per-vertex work (fog, lighting, gouraud),
- * turns off render-to-texture and skips every other frame.
- *
- * No preset overrides the texture filter. The game's UI textures pack glyph
- * cells edge to edge with no padding, so forcing linear on a surface the game
- * asked to point-sample bleeds the neighbouring cell in -- and where a cell
- * runs to the texture edge under REPEAT wrap it bleeds the far side in. Extra
- * quality comes from resolution and mip levels, not from second-guessing the
- * filter the game chose. */
 static const Preset k_presets[4] = {
-    /* res  filter      rtt skip mip aniso  fog       light     dither    shade */
-    {  4, TEXF_GAME,  1, 0,  1, 16,  OVR_GAME, OVR_GAME, OVR_GAME, SHADE_GAME }, /* Ultra  */
-    {  2, TEXF_GAME,  1, 0,  1,  8,  OVR_GAME, OVR_GAME, OVR_GAME, SHADE_GAME }, /* High   */
-    {  1, TEXF_GAME,  1, 0,  1,  1,  OVR_GAME, OVR_GAME, OVR_GAME, SHADE_GAME }, /* Medium */
-    {  1, TEXF_GAME,  0, 1,  0,  1,  OVR_OFF,  OVR_OFF,  OVR_OFF,  SHADE_FLAT }, /* Low    */
+    [PRESET_ULTRA]  = {  4, TEXF_GAME,  1, 0,  1, 16,
+                         OVR_GAME, OVR_GAME, OVR_GAME, SHADE_GAME },
+    [PRESET_HIGH]   = {  2, TEXF_GAME,  1, 0,  1,  8,
+                         OVR_GAME, OVR_GAME, OVR_GAME, SHADE_GAME },
+    [PRESET_MEDIUM] = {  1, TEXF_GAME,  1, 0,  1,  1,
+                         OVR_GAME, OVR_GAME, OVR_GAME, SHADE_GAME },
+    [PRESET_LOW]    = {  1, TEXF_GAME,  0, 1,  0,  1,
+                         OVR_OFF,  OVR_OFF,  OVR_OFF,  SHADE_FLAT },
 };
 
 void gfx_preset_apply(int preset)
@@ -213,7 +182,6 @@ void gfx_preset_apply(int preset)
     g_gfx.lighting   = p->lighting;
     g_gfx.dither     = p->dither;
     g_gfx.shading    = p->shading;
-    /* A preset never leaves a debug view switched on. */
     g_gfx.texturing = g_gfx.alpha_test = OVR_GAME;
     g_gfx.skip_lines = g_gfx.skip_points = 0;
     gfx_settings_touch();
@@ -235,7 +203,6 @@ int gfx_preset_current(void)
     return -1;
 }
 
-/* ---- TOML ---------------------------------------------------------------- */
 
 const char *gfx_settings_path(void)
 {
