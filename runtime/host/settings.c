@@ -51,6 +51,7 @@ static const Field k_fields[] = {
     F("render", "mipmaps",         T_BOOL,  mipmaps_on,       0, 1),
     F("render", "anisotropy",      T_INT,   anisotropy,       1, 16),
     F("render", "rtt",             T_BOOL,  rtt,              0, 1),
+    F("render", "tex_replace",     T_BOOL,  tex_replace,      0, 1),
 
     F("ge",     "fog",             T_INT,   fog,              0, 2),
     F("ge",     "lighting",        T_INT,   lighting,         0, 2),
@@ -127,6 +128,7 @@ void gfx_settings_defaults(void)
     g_gfx.mipmaps_on     = 1;
     g_gfx.anisotropy     = 1;
     g_gfx.rtt            = 1;
+    g_gfx.tex_replace    = 1;
     g_gfx.fog_distance   = 1.0f;
     g_gfx.fog_start      = 1.0f;
     g_gfx.contrast       = 1.0f;

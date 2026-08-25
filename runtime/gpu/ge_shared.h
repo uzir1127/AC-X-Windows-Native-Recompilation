@@ -29,6 +29,7 @@ typedef struct {
     uint32_t tex_wrap, tex_func, tex_env, tex_filter;
     int tex_w, tex_h;
     uint32_t clut_addr, clut_fmt;
+    uint32_t clut_load_bytes, clut_max_bytes;
     uint8_t clutram[2048];
     float tex_scale_u, tex_scale_v, tex_off_u, tex_off_v;
     uint32_t tex_map_mode;

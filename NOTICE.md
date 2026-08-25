@@ -30,12 +30,38 @@ directory's own `README.txt`.
 PPSSPP bundles as test assets. They are used here so on-screen text has
 something to render with.
 
+The texture replacement system in `runtime/gpu/tex_replace.c` reproduces
+PPSSPP's `GPU/Common/TextureReplacer.cpp` behaviour so that texture packs built
+for PPSSPP load unchanged: the `textures.ini` schema, the cache-key and
+content-hash construction, `StableQuickTexHash`, the wildcard lookup order, and
+the `%016llx%08x` hash filenames. It is GPLv2-or-later along with the rest of
+`runtime/gpu/`.
+
 ## Dear ImGui — MIT
 
 <https://github.com/ocornut/imgui>
 
 `third_party/imgui/` — the F4 debug and settings overlay. Full licence text in
 `third_party/imgui/LICENSE.txt`.
+
+## Basis Universal — Apache 2.0
+
+<https://github.com/BinomialLLC/basis_universal>
+
+`third_party/basis_universal/transcoder/` is the transcoder half of Basis
+Universal (release v1_60), used to read the `.ktx2` files in a PPSSPP texture
+pack: UASTC and ETC1S are transcoded to RGBA8888. Only that target is compiled
+in; every GPU block format is switched off in `build.py`. Full licence text in
+`third_party/basis_universal/LICENSE`.
+
+## Zstandard — BSD 3-Clause
+
+<https://github.com/facebook/zstd>
+
+`third_party/basis_universal/zstd/` is zstd's decompression-only single-file
+amalgamation, shipped inside the Basis Universal source tree and needed for
+KTX2 files that use Zstandard supercompression. Full licence text in
+`third_party/basis_universal/zstd/LICENSE`.
 
 ## FFmpeg
 

@@ -32,6 +32,7 @@ typedef struct {
     int   mipmaps_on;
     int   anisotropy;
     int   rtt;
+    int   tex_replace;
 
     int   fog;
     int   lighting;

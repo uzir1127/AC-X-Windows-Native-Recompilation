@@ -1,5 +1,6 @@
 #include "ui_overlay.h"
 #include "settings.h"
+#include "../gpu/tex_replace.h"
 
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
@@ -350,6 +351,17 @@ static void tab_render(void)
           "sampler skips every other texel and thin strokes break up. "
           "Takes effect on textures loaded from now on.");
 
+    ImGui::SeparatorText("Texture pack");
+    check("Replacement textures", &g_gfx.tex_replace,
+          "Loads a PPSSPP-format pack from textures/ULUS10176 (PSPRECO_TEXTURES "
+          "overrides the path): textures.ini plus png, dds or ktx2 files, or a "
+          "textures.zip. Takes effect on textures loaded from now on.");
+    {
+        char st[256];
+        texrep_status(st, (int)sizeof st);
+        ImGui::TextDisabled("Pack: %s", st);
+    }
+
     ImGui::SeparatorText("Backend");
     check("Render to texture", &g_gfx.rtt,
           "Off keeps every draw in the main target: faster, but effects that "
@@ -447,7 +459,10 @@ static void tab_debug(void)
 {
     check("GE counters to the log", &g_gfx.ge_stats_log, NULL);
     check("GPU backend logging", &g_gfx.ge_cmd_log, NULL);
-    check("Dump textures", &g_gfx.tex_dump, "Writes every uploaded texture.");
+    check("Dump textures", &g_gfx.tex_dump,
+          "Writes every texture the game uploads to textures/ULUS10176/new as "
+          "<hash>.png, skipping any the pack already replaces. Move them up one "
+          "directory and they are picked up without an ini entry.");
     if (ImGui::SliderInt("Frame dump interval", &g_gfx.frame_dump_every, 0, 600,
                          g_gfx.frame_dump_every ? "every %d frames" : "off"))
         gfx_settings_touch();

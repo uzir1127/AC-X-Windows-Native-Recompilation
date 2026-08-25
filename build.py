@@ -51,10 +51,27 @@ RUNTIME_SOURCES = (
 # executable needs no external codec libraries.
 CPP_SOURCES = (
     sorted((ROOT / "third_party" / "ppsspp" / "at3_standalone").glob("*.cpp"))
-    + [ROOT / "runtime" / "host" / "at3_decode.cpp"]
+    + [ROOT / "runtime" / "host" / "at3_decode.cpp",
+       ROOT / "runtime" / "gpu" / "tex_ktx2.cpp"]
 )
 CXXFLAGS_REPLACE = {"-std=c11": "-std=c++14"}
 CXXFLAGS_EXTRA = ["-fno-exceptions", "-fno-rtti"]
+
+BASISU_DIR = ROOT / "third_party" / "basis_universal"
+BASISU_DEFS = [
+    "-DBASISD_SUPPORT_KTX2=1", "-DBASISD_SUPPORT_KTX2_ZSTD=1",
+    "-DBASISD_SUPPORT_UASTC=1", "-DBASISD_SUPPORT_UASTC_HDR=0",
+    "-DBASISD_SUPPORT_DXT1=0", "-DBASISD_SUPPORT_DXT5A=0",
+    "-DBASISD_SUPPORT_BC7_MODE5=0", "-DBASISD_SUPPORT_PVRTC1=0",
+    "-DBASISD_SUPPORT_PVRTC2=0", "-DBASISD_SUPPORT_ETC2_EAC_A8=0",
+    "-DBASISD_SUPPORT_ETC2_EAC_RG11=0", "-DBASISD_SUPPORT_ASTC=0",
+    "-DBASISD_SUPPORT_ATC=0", "-DBASISD_SUPPORT_FXT1=0",
+]
+BASISU_CPP = [BASISU_DIR / "transcoder" / "basisu_transcoder.cpp"]
+BASISU_C   = [BASISU_DIR / "zstd" / "zstddeclib.c"]
+PER_SOURCE_FLAGS = {src: ["-std=c++17", "-w"] + BASISU_DEFS for src in BASISU_CPP}
+PER_SOURCE_FLAGS.update({src: ["-w"] for src in BASISU_C})
+PER_SOURCE_FLAGS[ROOT / "runtime" / "gpu" / "tex_ktx2.cpp"] = ["-std=c++17"] + BASISU_DEFS
 # The presenter is chosen at build time; exactly one of these is compiled.
 PRESENT_NULL  = ROOT / "runtime" / "host" / "present_null.c"
 PRESENT_SDL3  = ROOT / "runtime" / "host" / "present_sdl3vk.c"
@@ -79,6 +96,7 @@ def compile_one(cc: str, src: Path, obj: Path, extra: list[str]) -> tuple[Path, 
     flags = list(CFLAGS)
     if src.suffix == ".cpp":
         flags = [CXXFLAGS_REPLACE.get(f, f) for f in flags] + CXXFLAGS_EXTRA
+    flags += PER_SOURCE_FLAGS.get(src, [])
     cmd = [cc, "-c", *flags, *extra, str(src), "-o", str(obj)]
     p = subprocess.run(cmd, capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
@@ -123,7 +141,8 @@ def main(argv: list[str]) -> int:
               "tools/pspdisasm/gen_vfpu_decode.py", file=sys.stderr)
         return 2
 
-    sources = sorted(GEN.glob("*.c")) + RUNTIME_SOURCES + CPP_SOURCES
+    sources = (sorted(GEN.glob("*.c")) + RUNTIME_SOURCES + CPP_SOURCES
+               + BASISU_CPP + BASISU_C)
     if a.trace:
         extra = extra + ["-DPSPRECO_TRACE"]
         sources = sources + [TRACE_SOURCE]

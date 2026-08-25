@@ -3,6 +3,7 @@
 #include "pspreco.h"
 #include "ge.h"
 #include "ge_shared.h"
+#include "tex_replace.h"
 #include "../host/present.h"
 #include "../host/settings.h"
 
@@ -70,7 +71,11 @@ typedef struct {
     uint32_t levels;
     int pending;
     uint64_t lru;
+    int linear, clamp_u, clamp_v;
+    uint64_t bytes;
 } TexEnt;
+
+typedef struct { const uint32_t *px; int w, h; } TexLevel;
 
 typedef struct { PipeKey key; VkPipeline pipe; int used; } PipeEnt;
 
@@ -190,6 +195,8 @@ static unsigned long s_cnt_rb_by_reason[RB_REASONS];
 static unsigned long s_cnt_rb_rows_by_reason[RB_REASONS];
 static int s_rb_reason = RB_CLUT;
 static unsigned long s_cnt_snap = 0, s_cnt_texup = 0, s_cnt_xferblit = 0;
+static unsigned long s_cnt_repl = 0;
+static uint64_t s_tex_bytes = 0;
 
 static uint32_t s_texscratch[512 * 512];
 static uint32_t s_pxscratch[FB_W * FB_H];
@@ -556,11 +563,12 @@ static void stats_tick(void) {
     last_ms = now;
     fprintf(stderr, "GEGPU stats: submits=%lu tris=%lu spr=%lu lines=%lu rtt=%lu snap=%lu "
             "present[gpu=%lu cpu=%lu] upload=%lu readback=%lu[rows=%lu skip=%lu] "
-            "texup=%lu dirty=%lu xferblit=%lu pipes=%d texs=%d\n",
+            "texup=%lu dirty=%lu xferblit=%lu pipes=%d texs=%d repl=%lu texmb=%lu\n",
             s_cnt_submit, s_cnt_tri, s_cnt_spr, s_cnt_line, s_cnt_rtt, s_cnt_snap,
             s_cnt_present_gpu, s_cnt_present_cpu, s_cnt_upload, s_cnt_readback,
             s_cnt_readback_rows, s_cnt_readback_skip, s_cnt_texup,
-            s_cnt_dirty, s_cnt_xferblit, s_pipe_n, s_tex_n);
+            s_cnt_dirty, s_cnt_xferblit, s_pipe_n, s_tex_n,
+            s_cnt_repl, (unsigned long)(s_tex_bytes >> 20));
     fprintf(stderr, "GEGPU rback:");
     for (int i = 0; i < RB_REASONS; i++)
         fprintf(stderr, " %s=%lu/%lurows", k_rb_reason_name[i],
@@ -974,22 +982,47 @@ static uint64_t clut_hash(void) {
 }
 
 static uint64_t s_texlru = 1;
+static uint64_t s_tex_budget = 0;
 
-static void tex_evict_lru(void) {
+static uint64_t tex_budget(void) {
+    if (!s_tex_budget) {
+        const char *e = getenv("PSPRECO_TEX_BUDGET_MB");
+        unsigned long mb = e && e[0] ? strtoul(e, NULL, 10) : 0;
+        if (!mb) mb = 1024;
+        s_tex_budget = (uint64_t)mb << 20;
+    }
+    return s_tex_budget;
+}
+
+static void tex_free_entry(TexEnt *e) {
+    if (e->set)  vkFreeDescriptorSets(s_dev, s_dpool_tex, 1, &e->set);
+    if (e->smp)  vkDestroySampler(s_dev, e->smp, NULL);
+    if (e->view) vkDestroyImageView(s_dev, e->view, NULL);
+    if (e->img)  vkDestroyImage(s_dev, e->img, NULL);
+    if (e->mem)  vkFreeMemory(s_dev, e->mem, NULL);
+    s_tex_bytes -= e->bytes;
+    e->set = VK_NULL_HANDLE; e->smp = VK_NULL_HANDLE;
+    e->view = VK_NULL_HANDLE; e->img = VK_NULL_HANDLE; e->mem = VK_NULL_HANDLE;
+    e->bytes = 0;
+}
+
+static void tex_evict_to(int goal, uint64_t byte_goal) {
+    if (s_tex_n <= goal && s_tex_bytes <= byte_goal) return;
     gpu_sync(); vkDeviceWaitIdle(s_dev);
-    int goal = s_tex_n - MAX_TEX / 4;
-    while (s_tex_n > goal) {
+    while (s_tex_n > 0 && (s_tex_n > goal || s_tex_bytes > byte_goal)) {
         int v = 0;
         for (int i = 1; i < s_tex_n; i++)
             if (s_tex[i].lru < s_tex[v].lru) v = i;
-        TexEnt *e = &s_tex[v];
-        vkFreeDescriptorSets(s_dev, s_dpool_tex, 1, &e->set);
-        vkDestroySampler(s_dev, e->smp, NULL);
-        vkDestroyImageView(s_dev, e->view, NULL);
-        vkDestroyImage(s_dev, e->img, NULL);
-        vkFreeMemory(s_dev, e->mem, NULL);
-        *e = s_tex[--s_tex_n];
+        tex_free_entry(&s_tex[v]);
+        s_tex[v] = s_tex[--s_tex_n];
     }
+}
+
+static void tex_evict_lru(void) {
+    int goal = s_tex_n;
+    uint64_t budget = tex_budget();
+    if (s_tex_n >= MAX_TEX) goal = s_tex_n - MAX_TEX / 4;
+    tex_evict_to(goal, budget - budget / 4);
 }
 
 static void mip_barrier(VkCommandBuffer cmd, VkImage img, uint32_t level,
@@ -1011,21 +1044,66 @@ static void mip_barrier(VkCommandBuffer cmd, VkImage img, uint32_t level,
                          dst_stage, 0, 0, NULL, 0, NULL, 1, &mb);
 }
 
-static int tex_upload(VkImage img, const uint32_t *px, int w, int h, uint32_t levels) {
-    XferSlot *x = xfer_acquire();
-    memcpy(x->map, px, (size_t)w * (size_t)h * 4);
+static VkBuffer       s_texstage;
+static VkDeviceMemory s_texstage_mem;
+static void          *s_texstage_map;
+static VkDeviceSize   s_texstage_size;
+static uint64_t       s_texstage_id;
+
+static int texstage_reserve(VkDeviceSize need) {
+    if (s_texstage && s_texstage_size >= need) {
+        gpu_wait_id(s_texstage_id);
+        return 1;
+    }
+    gpu_sync();
+    if (s_texstage) {
+        vkDestroyBuffer(s_dev, s_texstage, NULL);
+        vkFreeMemory(s_dev, s_texstage_mem, NULL);
+        s_texstage = VK_NULL_HANDLE;
+        s_texstage_mem = VK_NULL_HANDLE;
+        s_texstage_map = NULL;
+        s_texstage_size = 0;
+    }
+    VkDeviceSize want = XFER_SIZE;
+    while (want < need) want *= 2;
+    if (!make_buffer(want, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     &s_texstage, &s_texstage_mem, &s_texstage_map))
+        return 0;
+    s_texstage_size = want;
+    return 1;
+}
+
+static int tex_upload(VkImage img, const TexLevel *lv, int nlv, uint32_t levels) {
+    VkDeviceSize total = 0, off = 0;
+    for (int i = 0; i < nlv; i++)
+        total += (VkDeviceSize)lv[i].w * (VkDeviceSize)lv[i].h * 4;
+    if (!total || !texstage_reserve(total)) return 0;
+    for (int i = 0; i < nlv; i++) {
+        size_t n = (size_t)lv[i].w * (size_t)lv[i].h * 4;
+        memcpy((uint8_t *)s_texstage_map + off, lv[i].px, n);
+        off += n;
+    }
     if (!cmd_begin()) return 0;
 
-    mip_barrier(s_cmd, img, 0, VK_IMAGE_LAYOUT_UNDEFINED,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-    VkBufferImageCopy bic = {0};
-    bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    bic.imageSubresource.layerCount = 1;
-    bic.imageExtent.width = (uint32_t)w; bic.imageExtent.height = (uint32_t)h; bic.imageExtent.depth = 1;
-    vkCmdCopyBufferToImage(s_cmd, x->buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    off = 0;
+    for (int i = 0; i < nlv; i++) {
+        mip_barrier(s_cmd, img, (uint32_t)i, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy bic = {0};
+        bic.bufferOffset = off;
+        bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        bic.imageSubresource.mipLevel = (uint32_t)i;
+        bic.imageSubresource.layerCount = 1;
+        bic.imageExtent.width = (uint32_t)lv[i].w;
+        bic.imageExtent.height = (uint32_t)lv[i].h;
+        bic.imageExtent.depth = 1;
+        vkCmdCopyBufferToImage(s_cmd, s_texstage, img,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+        off += (VkDeviceSize)lv[i].w * (VkDeviceSize)lv[i].h * 4;
+    }
 
-    int mw = w, mh = h;
-    for (uint32_t l = 1; l < levels; l++) {
+    int mw = lv[nlv - 1].w, mh = lv[nlv - 1].h;
+    for (uint32_t l = (uint32_t)nlv; l < levels; l++) {
         int nw = mw > 1 ? mw / 2 : 1, nh = mh > 1 ? mh / 2 : 1;
         mip_barrier(s_cmd, img, l - 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -1047,24 +1125,43 @@ static int tex_upload(VkImage img, const uint32_t *px, int w, int h, uint32_t le
                     VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
         mw = nw; mh = nh;
     }
+
     mip_barrier(s_cmd, img, levels - 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    for (uint32_t l = 0; l + 1 < (uint32_t)nlv; l++)
+        mip_barrier(s_cmd, img, l, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
     if (!cmd_submit()) return 0;
-    xfer_used(x);
+    s_texstage_id = s_submit_id;
     return 1;
 }
 
-static int tex_make(const uint32_t *px, int w, int h, int linear, int clamp_u, int clamp_v,
-                    VkImage *img, VkDeviceMemory *mem, VkImageView *view, VkSampler *smp) {
-    uint32_t levels = (linear && g_gfx.mipmaps_on) ? mip_levels_for(w, h) : 1;
+static uint64_t tex_size_bytes(int w, int h, uint32_t levels) {
+    uint64_t n = 0;
+    int mw = w, mh = h;
+    for (uint32_t l = 0; l < levels; l++) {
+        n += (uint64_t)mw * (uint64_t)mh * 4;
+        mw = mw > 1 ? mw / 2 : 1;
+        mh = mh > 1 ? mh / 2 : 1;
+    }
+    return n;
+}
+
+static int tex_make(TexEnt *e, const TexLevel *lv, int nlv, uint32_t levels,
+                    int linear, int clamp_u, int clamp_v) {
+    int w = lv[0].w, h = lv[0].h;
     if (!make_image_mip((uint32_t)w, (uint32_t)h, levels, VK_FORMAT_R8G8B8A8_UNORM,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                        | VK_IMAGE_USAGE_SAMPLED_BIT, img, mem))
+                        | VK_IMAGE_USAGE_SAMPLED_BIT, &e->img, &e->mem))
         return 0;
-    if (!tex_upload(*img, px, w, h, levels)) return 0;
-    if (!make_view_mip(*img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
-                       levels, view)) return 0;
+    e->bytes = tex_size_bytes(w, h, levels);
+    s_tex_bytes += e->bytes;
+    if (!tex_upload(e->img, lv, nlv, levels)) return 0;
+    if (!make_view_mip(e->img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                       levels, &e->view)) return 0;
     VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
     sci.magFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     sci.minFilter = sci.magFilter;
@@ -1079,7 +1176,11 @@ static int tex_make(const uint32_t *px, int w, int h, int linear, int clamp_u, i
         sci.anisotropyEnable = VK_TRUE;
         sci.maxAnisotropy = want < s_max_aniso ? want : s_max_aniso;
     }
-    VKC(vkCreateSampler(s_dev, &sci, NULL, smp));
+    VKC(vkCreateSampler(s_dev, &sci, NULL, &e->smp));
+    e->set = make_descriptor(e->view, e->smp, s_dpool_tex);
+    if (!e->set) return 0;
+    e->w = w; e->h = h; e->levels = levels;
+    e->linear = linear; e->clamp_u = clamp_u; e->clamp_v = clamp_v;
     return 1;
 }
 
@@ -1087,15 +1188,56 @@ static void tex_cache_flush(void) {
     if (!s_tex_n) return;
     submit_pending();
     gpu_sync(); vkDeviceWaitIdle(s_dev);
-    for (int i = 0; i < s_tex_n; i++) {
-        TexEnt *e = &s_tex[i];
-        vkFreeDescriptorSets(s_dev, s_dpool_tex, 1, &e->set);
-        vkDestroySampler(s_dev, e->smp, NULL);
-        vkDestroyImageView(s_dev, e->view, NULL);
-        vkDestroyImage(s_dev, e->img, NULL);
-        vkFreeMemory(s_dev, e->mem, NULL);
-    }
+    for (int i = 0; i < s_tex_n; i++) tex_free_entry(&s_tex[i]);
     s_tex_n = 0;
+    s_tex_bytes = 0;
+}
+
+static int tex_fill(TexEnt *e, int pw, int ph, int linear, int clamp_u, int clamp_v) {
+    TexRepImage rep;
+    TexRepId id;
+    TexLevel lv[TEXREP_MAX_LEVELS];
+    int nlv = 1, have = 0, ident = 0, filt = linear;
+    uint32_t levels;
+
+    memset(&rep, 0, sizeof rep);
+    memset(&id, 0, sizeof id);
+
+    if (texrep_replace_on() || texrep_dump_on()) ident = texrep_identify(&id);
+    if (ident) have = texrep_find(&id, &rep);
+
+    if (have) {
+        if (rep.filtering == TEXREP_FILTER_NEAREST) filt = 0;
+        else if (rep.filtering == TEXREP_FILTER_LINEAR) filt = 1;
+        nlv = rep.levels;
+        for (int i = 0; i < nlv; i++) {
+            lv[i].px = rep.px[i];
+            lv[i].w = rep.w[i];
+            lv[i].h = rep.h[i];
+        }
+    } else {
+        ge_decode_tex_rgba(s_texscratch);
+        if (ident) texrep_dump(&id, s_texscratch, pw, ph);
+        lv[0].px = s_texscratch;
+        lv[0].w = pw;
+        lv[0].h = ph;
+    }
+
+    levels = (uint32_t)nlv;
+    if (nlv == 1 && filt && g_gfx.mipmaps_on) levels = mip_levels_for(lv[0].w, lv[0].h);
+
+    if (e->img && (e->w != lv[0].w || e->h != lv[0].h || e->levels != levels ||
+                   e->linear != filt || e->clamp_u != clamp_u || e->clamp_v != clamp_v)) {
+        gpu_sync(); vkDeviceWaitIdle(s_dev);
+        tex_free_entry(e);
+    }
+
+    int ok;
+    if (!e->img) ok = tex_make(e, lv, nlv, levels, filt, clamp_u, clamp_v);
+    else         ok = tex_upload(e->img, lv, nlv, levels);
+
+    if (have) { texrep_release(&rep); if (ok) s_cnt_repl++; }
+    return ok;
 }
 
 static VkDescriptorSet tex_get_inner(void) {
@@ -1118,31 +1260,31 @@ static VkDescriptorSet tex_get_inner(void) {
         TexEnt *e = &s_tex[i];
         if (e->key != key) continue;
         e->lru = s_texlru++;
-        if (e->hash == hash) { e->pending = 1; return e->set; }
+        if (e->hash == hash && e->set) { e->pending = 1; return e->set; }
         if (e->pending) submit_pending();
         gpu_sync();
-        ge_decode_tex_rgba(s_texscratch);
-        if (!tex_upload(e->img, s_texscratch, e->w, e->h, e->levels)) return s_white_set;
+        if (!tex_fill(e, w, h, linear, clamp_u, clamp_v)) {
+            tex_free_entry(e);
+            *e = s_tex[--s_tex_n];
+            return s_white_set;
+        }
         e->hash = hash;
         e->pending = 1;
         s_cnt_texup++;
         return e->set;
     }
 
-    if (s_tex_n >= MAX_TEX) {
+    if (s_tex_n >= MAX_TEX || s_tex_bytes > tex_budget()) {
         submit_pending();
         tex_evict_lru();
     }
-    ge_decode_tex_rgba(s_texscratch);
     TexEnt *e = &s_tex[s_tex_n];
     memset(e, 0, sizeof(*e));
-    if (!tex_make(s_texscratch, w, h, linear, clamp_u, clamp_v, &e->img, &e->mem, &e->view, &e->smp))
+    if (!tex_fill(e, w, h, linear, clamp_u, clamp_v)) {
+        tex_free_entry(e);
         return s_white_set;
-    e->set = make_descriptor(e->view, e->smp, s_dpool_tex);
-    if (!e->set) return s_white_set;
+    }
     e->key = key; e->hash = hash;
-    e->w = w; e->h = h;
-    e->levels = (linear && g_gfx.mipmaps_on) ? mip_levels_for(w, h) : 1;
     e->pending = 1;
     e->lru = s_texlru++;
     s_cnt_texup++;
@@ -1859,8 +2001,22 @@ int gegpu_init(void) {
 
     {
         uint32_t white = 0xFFFFFFFFu;
-        if (!tex_make(&white, 1, 1, 0, 1, 1, &s_white, &s_white_mem, &s_white_view, &s_white_smp))
+        TexLevel lv = { &white, 1, 1 };
+        VkSamplerCreateInfo wsci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        if (!make_image_mip(1, 1, 1, VK_FORMAT_R8G8B8A8_UNORM,
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                            | VK_IMAGE_USAGE_SAMPLED_BIT, &s_white, &s_white_mem))
             return 0;
+        if (!tex_upload(s_white, &lv, 1, 1)) return 0;
+        if (!make_view_mip(s_white, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                           1, &s_white_view)) return 0;
+        wsci.magFilter = VK_FILTER_NEAREST;
+        wsci.minFilter = VK_FILTER_NEAREST;
+        wsci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        wsci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        wsci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        wsci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VKC(vkCreateSampler(s_dev, &wsci, NULL, &s_white_smp));
         s_white_set = make_descriptor(s_white_view, s_white_smp, s_dpool_fix);
         if (!s_white_set) return 0;
     }
@@ -1873,6 +2029,8 @@ int gegpu_init(void) {
     s_snap_n = make_descriptor(s_snap_view, s_smp_n, s_dpool_fix);
     s_snap_l = make_descriptor(s_snap_view, s_smp_l, s_dpool_fix);
     if (!s_snap_n || !s_snap_l) return 0;
+
+    texrep_init();
 
     s_ready = 1;
     ge_set_gpu_hooks(&k_hooks);
@@ -1889,15 +2047,10 @@ void gegpu_shutdown(void) {
     s_ready = 0;
     gpu_sync(); vkDeviceWaitIdle(s_dev);
 
-    for (int i = 0; i < s_tex_n; i++) {
-        TexEnt *e = &s_tex[i];
-        vkFreeDescriptorSets(s_dev, s_dpool_tex, 1, &e->set);
-        vkDestroySampler(s_dev, e->smp, NULL);
-        vkDestroyImageView(s_dev, e->view, NULL);
-        vkDestroyImage(s_dev, e->img, NULL);
-        vkFreeMemory(s_dev, e->mem, NULL);
-    }
+    for (int i = 0; i < s_tex_n; i++) tex_free_entry(&s_tex[i]);
     s_tex_n = 0;
+    s_tex_bytes = 0;
+    texrep_shutdown();
 
     for (int i = 0; i < MAX_TGT; i++) target_destroy(&s_tgts[i]);
 
@@ -1928,6 +2081,12 @@ void gegpu_shutdown(void) {
         if (s_xfer[i].buf) vkDestroyBuffer(s_dev, s_xfer[i].buf, NULL);
         if (s_xfer[i].mem) vkFreeMemory(s_dev, s_xfer[i].mem, NULL);
     }
+    if (s_texstage) vkDestroyBuffer(s_dev, s_texstage, NULL);
+    if (s_texstage_mem) vkFreeMemory(s_dev, s_texstage_mem, NULL);
+    s_texstage = VK_NULL_HANDLE;
+    s_texstage_mem = VK_NULL_HANDLE;
+    s_texstage_map = NULL;
+    s_texstage_size = 0;
     if (s_vbuf) vkDestroyBuffer(s_dev, s_vbuf, NULL);
     if (s_vbuf_m) vkFreeMemory(s_dev, s_vbuf_m, NULL);
     free(s_vstage);

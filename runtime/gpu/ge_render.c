@@ -2441,6 +2441,10 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
                     s_gpu->flush("loadclut");
                 uint32_t bytes = (data & 0x3F) * 32;
                 if (bytes > sizeof(ge.clutram)) bytes = sizeof(ge.clutram);
+                if (bytes) {
+                    ge.clut_load_bytes = bytes;
+                    if (bytes > ge.clut_max_bytes) ge.clut_max_bytes = bytes;
+                }
                 for (uint32_t i = 0; i < bytes; i += 4) {
                     uint32_t w = MEM_R32(ge.clut_addr + i);
                     memcpy(&ge.clutram[i], &w, 4);

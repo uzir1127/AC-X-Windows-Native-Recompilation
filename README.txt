@@ -28,9 +28,10 @@ runtime/hle/      high-level reimplementations of the PSP's kernel modules
 runtime/host/     window, audio, input, video-decode, and the F4 debug overlay
 tools/            standalone utilities (ISO/CDI extraction, ELF/PRX loading,
                   disassembly, VFPU tables, trace comparison)
-third_party/      Dear ImGui (MIT) and a standalone ATRAC3/ATRAC3+ decoder
-                  lifted from FFmpeg/PPSSPP, plus the PSP system fonts PPSSPP
-                  ships as test assets (needed to draw any text at all)
+third_party/      Dear ImGui (MIT), a standalone ATRAC3/ATRAC3+ decoder lifted
+                  from FFmpeg/PPSSPP, the PSP system fonts PPSSPP ships as test
+                  assets (needed to draw any text at all), and the Basis
+                  Universal transcoder + zstd for .ktx2 texture packs
 data/             the syscall NID database and VFPU instruction table the
                   recompiler and disassembler read as input
 tests/            regression checks: a boot trace, and a decompression
@@ -134,6 +135,41 @@ game.iso in the current directory if omitted. PSPRECO_ISO also works as an
 environment variable if you'd rather not pass it on the command line.
 
 
+Replacement textures
+---------------------
+The Vulkan backend reads PPSSPP-format texture packs, so packs published for
+PPSSPP work here unmodified. Put the pack's contents -- textures.ini and its
+subdirectories, or a textures.zip -- in:
+
+    textures/ULUS10176/
+
+next to the executable, or point PSPRECO_TEXTURES at the directory instead.
+It is on by default; the F4 overlay has a switch under Renderer that also
+shows which pack was picked up and how many entries it has.
+
+Supported: png (any colour type and bit depth), dds (DXT1/3/5 and
+uncompressed 32-bit), and ktx2 (UASTC or ETC1S, with or without Zstandard
+supercompression), loose in a directory or inside textures.zip. The ini's
+[hashes], [hashranges], [filtering], [reducehashranges], [options] and [games]
+sections are read with the same meaning PPSSPP gives them, including the quick,
+xxh32 and xxh64 hashes, ignoreAddress, reduceHash, and per-level "hash_1"
+entries. Files in the pack root named after their hash are picked up without
+an ini entry at all. ktx2 files supply their own mip chain; anything else gets
+mips generated the way the game's own textures do.
+
+To build a pack, turn on "Dump textures" under Debug. Every texture the game
+uploads is written to textures/ULUS10176/new as <hash>.png, skipping the ones
+the pack already replaces. Move a file up one directory to see it in game, or
+list it in textures.ini under a friendlier name. The hashes are the same ones
+PPSSPP computes, so a pack made here works there and vice versa.
+
+Replacement textures are read at the moment the game first uploads the texture,
+which costs a few milliseconds each. Note that a full HD pack can hold a lot
+more texture memory than the game does -- roughly a gigabyte for a 1024x1024
+pack -- so the cache evicts by least-recently-used above a budget that
+PSPRECO_TEX_BUDGET_MB sets (1024 by default).
+
+
 Tests
 -----
     python tests/boot_check.py build/pspreco.exe
@@ -152,3 +188,6 @@ Third-party components
   FFmpeg by the PPSSPP project (see its own README.txt for provenance)
 - third_party/ppsspp/assets/flash0/font -- the PSP system fonts PPSSPP bundles
   as test assets; used here so on-screen text has something to render with
+- third_party/basis_universal -- the Basis Universal transcoder, Apache 2.0
+  licensed, plus zstd's decompression-only amalgamation, BSD 3-Clause; these
+  read the .ktx2 files in a PPSSPP texture pack
