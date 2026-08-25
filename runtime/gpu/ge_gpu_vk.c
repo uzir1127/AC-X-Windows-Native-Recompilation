@@ -72,6 +72,7 @@ typedef struct {
     int pending;
     uint64_t lru;
     int linear, clamp_u, clamp_v;
+    float half_u, half_v;
     uint64_t bytes;
 } TexEnt;
 
@@ -1193,6 +1194,8 @@ static void tex_cache_flush(void) {
     s_tex_bytes = 0;
 }
 
+static float s_tex_half[2];
+
 static int tex_fill(TexEnt *e, int pw, int ph, int linear, int clamp_u, int clamp_v) {
     TexRepImage rep;
     TexRepId id;
@@ -1223,6 +1226,7 @@ static int tex_fill(TexEnt *e, int pw, int ph, int linear, int clamp_u, int clam
         lv[0].h = ph;
     }
 
+    if (!filt || !g_gfx.mipmaps_on) nlv = 1;
     levels = (uint32_t)nlv;
     if (nlv == 1 && filt && g_gfx.mipmaps_on) levels = mip_levels_for(lv[0].w, lv[0].h);
 
@@ -1236,13 +1240,23 @@ static int tex_fill(TexEnt *e, int pw, int ph, int linear, int clamp_u, int clam
     if (!e->img) ok = tex_make(e, lv, nlv, levels, filt, clamp_u, clamp_v);
     else         ok = tex_upload(e->img, lv, nlv, levels);
 
+    e->half_u = have ? 0.5f * (float)pw / (float)lv[0].w - 0.5f : 0.0f;
+    e->half_v = have ? 0.5f * (float)ph / (float)lv[0].h - 0.5f : 0.0f;
+
     if (have) { texrep_release(&rep); if (ok) s_cnt_repl++; }
     return ok;
+}
+
+static VkDescriptorSet tex_bind(TexEnt *e) {
+    s_tex_half[0] = e->half_u;
+    s_tex_half[1] = e->half_v;
+    return e->set;
 }
 
 static VkDescriptorSet tex_get_inner(void) {
     int w = s_ge->tex_w, h = s_ge->tex_h;
     static unsigned tex_gen;
+    s_tex_half[0] = s_tex_half[1] = 0.0f;
     if (tex_gen != g_gfx_generation) { tex_gen = g_gfx_generation; tex_cache_flush(); }
     if (w <= 0 || h <= 0 || w > 512 || h > 512) return s_white_set;
     int linear  = (s_ge->tex_filter & 1) || ((s_ge->tex_filter >> 8) & 1);
@@ -1260,18 +1274,19 @@ static VkDescriptorSet tex_get_inner(void) {
         TexEnt *e = &s_tex[i];
         if (e->key != key) continue;
         e->lru = s_texlru++;
-        if (e->hash == hash && e->set) { e->pending = 1; return e->set; }
+        if (e->hash == hash && e->set) { e->pending = 1; return tex_bind(e); }
         if (e->pending) submit_pending();
         gpu_sync();
         if (!tex_fill(e, w, h, linear, clamp_u, clamp_v)) {
             tex_free_entry(e);
             *e = s_tex[--s_tex_n];
+            s_tex_half[0] = s_tex_half[1] = 0.0f;
             return s_white_set;
         }
         e->hash = hash;
         e->pending = 1;
         s_cnt_texup++;
-        return e->set;
+        return tex_bind(e);
     }
 
     if (s_tex_n >= MAX_TEX || s_tex_bytes > tex_budget()) {
@@ -1282,6 +1297,7 @@ static VkDescriptorSet tex_get_inner(void) {
     memset(e, 0, sizeof(*e));
     if (!tex_fill(e, w, h, linear, clamp_u, clamp_v)) {
         tex_free_entry(e);
+        s_tex_half[0] = s_tex_half[1] = 0.0f;
         return s_white_set;
     }
     e->key = key; e->hash = hash;
@@ -1289,7 +1305,7 @@ static VkDescriptorSet tex_get_inner(void) {
     e->lru = s_texlru++;
     s_cnt_texup++;
     s_tex_n++;
-    return e->set;
+    return tex_bind(e);
 }
 
 static VkDescriptorSet tex_get(void) {
@@ -1522,9 +1538,17 @@ static void build_state(int persp, int sprite, Batch *b) {
                 target_readback(src);
                 s_rb_reason = RB_CLUT;
                 b->dset = tex_get();
+                if (!sprite) {
+                    b->pc.texsize[2] = s_tex_half[0];
+                    b->pc.texsize[3] = s_tex_half[1];
+                }
             }
         } else {
             b->dset = tex_get();
+            if (!sprite) {
+                b->pc.texsize[2] = s_tex_half[0];
+                b->pc.texsize[3] = s_tex_half[1];
+            }
         }
     }
     b->pc.cfg[0] = (int32_t)((g->tex_func & 7) | ((uint32_t)flags << 8));

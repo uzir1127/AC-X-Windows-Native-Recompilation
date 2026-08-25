@@ -439,6 +439,7 @@ typedef struct Alias {
     uint32_t hash;
     int      nlev;
     int      failed;
+    int      logged;
     char    *file[TEXREP_MAX_LEVELS];
 } Alias;
 
@@ -477,6 +478,7 @@ static int      s_skip_dxt1_128x64;
 static int      s_skip_dxt1_128x128;
 
 static int      s_ready;
+static int      s_log = -1;
 static int      s_replace_on;
 static int      s_dump_on;
 static char     s_base[1024];
@@ -1375,6 +1377,18 @@ int texrep_find(TexRepId *id, TexRepImage *img)
             int fh = (int)(((long long)img->h[lv] * id->psp_h) / newh);
             pad_level(img, lv, fw, fh);
         }
+    }
+
+    if (s_log < 0) {
+        const char *e = getenv("PSPRECO_TEX_LOG");
+        s_log = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    if (s_log && !a->logged) {
+        a->logged = 1;
+        fprintf(stderr, "[tex] %3dx%-3d -> %4dx%-4d %.2fx %d level(s)  %s\n",
+                id->psp_w, id->psp_h, img->w[0], img->h[0],
+                (double)img->w[0] / (double)(id->psp_w ? id->psp_w : 1),
+                img->levels, a->file[0]);
     }
 
     id->hash = used_hash;
