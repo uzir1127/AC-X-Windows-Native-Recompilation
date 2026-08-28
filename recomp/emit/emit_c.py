@@ -98,6 +98,27 @@ class Unsupported(Exception):
     pass
 
 
+# Emitted into symbols.h. A `jal` to a known function becomes a direct C call,
+# which cannot be intercepted, so overrides used to reach only the functions
+# the engine dispatches through a pointer. A PSPRECO_MODDABLE build sends every
+# direct call through the dispatch table recomp_lookup already bisects, so a
+# hook is one store into g_func_ptr and covers direct and indirect sites alike.
+# A normal build expands to the bare function and is unchanged.
+_CALL_MACRO = """
+#ifdef PSPRECO_MODDABLE
+/* Moddable build: a load and an indirect branch per call, in exchange for
+ * every recompiled function being replaceable at runtime. */
+#  define PSPRECO_CALL(idx, fn) (g_func_ptr[idx])
+#  define PSPRECO_FUNC_PTR_QUAL
+extern RecompFn g_func_ptr[PSPRECO_FUNC_COUNT];
+#else
+#  define PSPRECO_CALL(idx, fn) (fn)
+#  define PSPRECO_FUNC_PTR_QUAL const
+extern const RecompFn g_func_ptr[PSPRECO_FUNC_COUNT];
+#endif
+"""
+
+
 # ---------------------------------------------------------------------------
 # One instruction -> a list of C statements (no control flow)
 # ---------------------------------------------------------------------------
@@ -337,6 +358,12 @@ class Emitter:
         self.funcs = funcs
         self.starts = sorted(f.start for f in funcs)
         self.entry = {f.start for f in funcs}
+        # Position in `funcs` IS the dispatch-table index: dispatch.c is
+        # emitted from this same list in this same order, and recomp_lookup
+        # binary-searches it. A moddable build routes direct calls through
+        # that table so any function can be replaced, not only the ones the
+        # engine happens to reach through a pointer.
+        self.index = {f.start: i for i, f in enumerate(funcs)}
         self.stub_names = stub_names
         self.stats: Counter[str] = Counter()
         self.unsupported: list[str] = []
@@ -550,7 +577,8 @@ class Emitter:
             return (f"hle_dispatch_stub(c, ram, 0x{target:08x}u);"
                     f" /* {self.stub_names[target]} */")
         if target in self.entry:
-            return f"{self.fname(target)}(c, ram);"
+            return (f"PSPRECO_CALL({self.index[target]}, "
+                    f"{self.fname(target)})(c, ram);")
         return f"recomp_call_indirect(c, ram, 0x{pc:08x}u, 0x{target:08x}u);"
 
     def tail_jump(self, pc: int, target: int) -> str:
@@ -558,7 +586,8 @@ class Emitter:
             return (f"hle_dispatch_stub(c, ram, 0x{target:08x}u); return;"
                     f" /* {self.stub_names[target]} */")
         if target in self.entry:
-            return f"{self.fname(target)}(c, ram); return;"
+            return (f"PSPRECO_CALL({self.index[target]}, "
+                    f"{self.fname(target)})(c, ram); return;")
         return (f"recomp_call_indirect(c, ram, 0x{pc:08x}u, "
                 f"0x{target:08x}u); return;")
 
@@ -632,8 +661,8 @@ def main(argv: list[str]) -> int:
         "void vfpu_exec(CpuCtx *c, u8 *ram, u32 word);\n\n"
         + decls +
         "\n\n#define PSPRECO_FUNC_COUNT " + str(len(funcs)) +
-        "\nextern const u32      g_func_addr[PSPRECO_FUNC_COUNT];"
-        "\nextern const RecompFn g_func_ptr [PSPRECO_FUNC_COUNT];\n"
+        "\nextern const u32 g_func_addr[PSPRECO_FUNC_COUNT];\n"
+        + _CALL_MACRO +
         "\n#endif\n", encoding="utf-8")
 
     # dispatch.c -- sorted address table for recomp_lookup()
@@ -644,7 +673,7 @@ def main(argv: list[str]) -> int:
         '#include "pspreco.h"\n#include "symbols.h"\n\n'
         "const u32 g_func_addr[PSPRECO_FUNC_COUNT] = {\n    "
         + addrs + "\n};\n\n"
-        "const RecompFn g_func_ptr[PSPRECO_FUNC_COUNT] = {\n    "
+        "PSPRECO_FUNC_PTR_QUAL RecompFn g_func_ptr[PSPRECO_FUNC_COUNT] = {\n    "
         + ptrs + "\n};\n", encoding="utf-8")
 
     # stubs.c -- the import thunk table, so an HLE miss can name the function

@@ -68,6 +68,19 @@ KTX2 files that use Zstandard supercompression. Full licence text in
 The ATRAC3/ATRAC3+ decoding code in `third_party/ppsspp/at3_standalone/`
 originates in FFmpeg. See that directory's `README.txt` for provenance.
 
+## Lua — MIT
+
+<https://www.lua.org/>
+
+`third_party/lua/` is Lua 5.4.9, unmodified, from
+<https://www.lua.org/ftp/lua-5.4.9.tar.gz>
+(sha256 `2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6`).
+It is the scripting host mods are written against; see
+`runtime/hle/script.c`. Only the library is vendored — upstream's `lua.c` and
+`luac.c` are the standalone interpreter and bytecode compiler and each carry
+their own `main()`, so neither is included. Licence text is in
+`third_party/lua/README`.
+
 ## AI assistance disclosure
 
 The Vulkan backend in `runtime/gpu/` is an original implementation for this

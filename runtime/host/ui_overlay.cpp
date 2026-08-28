@@ -222,7 +222,7 @@ int ui_handle_event(const void *sdl_event)
     const SDL_Event *e = (const SDL_Event *)sdl_event;
     if (!s_inited || !e) return 0;
     ImGui_ImplSDL3_ProcessEvent(e);
-    if (!s_visible) return 0;
+    if (!s_visible && !plane_ui_visible()) return 0;
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
     case SDL_EVENT_TEXT_INPUT:
@@ -559,6 +559,7 @@ void ui_new_frame(void)
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
     if (s_visible) draw_menu();
+    plane_ui_draw();
     draw_readout();
     ImGui::Render();
 }

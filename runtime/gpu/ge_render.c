@@ -2,6 +2,7 @@
 #include "ge.h"
 #include "ge_shared.h"
 #include "../host/settings.h"
+#include "../hle/modloader.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -2408,7 +2409,13 @@ int ge_state_command(u8 *ram, u32 op, u32 base) {
 
             case GE_TEXTUREMAPENABLE: ge.tex_enable=data&1; break;
             case GE_TEXADDR0:     ge.tex_addr=(ge.tex_addr&0xFF000000)|(data&0x00FFFFFF); break;
-            case GE_TEXBUFWIDTH0: ge.tex_bufw=data&0xFFFF; ge.tex_addr=(ge.tex_addr&0x00FFFFFF)|((data&0xFF0000)<<8); break;
+            case GE_TEXBUFWIDTH0:
+                ge.tex_bufw=data&0xFFFF; ge.tex_addr=(ge.tex_addr&0x00FFFFFF)|((data&0xFF0000)<<8);
+                /* Completes a texture base; the low 24 bits came from
+                 * TEXADDR0. Two compares to notice a mod-supplied one. */
+                if (ge.tex_addr >= MOD_HEAP_BASE && ge.tex_addr < MOD_HEAP_END)
+                    mod_note_tex(ge.tex_addr);
+                break;
             case GE_TEXSIZE0:  ge.tex_w=1<<(data&0xF); ge.tex_h=1<<((data>>8)&0xF); break;
             case GE_TEXADDR0+1: case GE_TEXADDR0+2: case GE_TEXADDR0+3: case GE_TEXADDR0+4:
             case GE_TEXADDR0+5: case GE_TEXADDR0+6: case GE_TEXADDR0+7:

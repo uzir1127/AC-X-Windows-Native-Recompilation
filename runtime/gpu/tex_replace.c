@@ -201,7 +201,10 @@ static uint32_t quick_tex_hash(const void *checkp, uint32_t size)
 static uint32_t max_size_at(uint32_t address)
 {
     uint32_t a = address & 0x3FFFFFFFu;
-    if ((address & 0x3E000000u) == 0x08000000u) return 0x0A000000u - a;
+    /* User RAM, extended through the mod heap: modloader.c stages injected
+     * assets from 0x0A000000 up, and a .PDW there must hash like any other
+     * or texture packs stop seeing it. */
+    if ((address & 0x38000000u) == 0x08000000u) return 0x10000000u - a;
     if ((address & 0x3F800000u) == 0x04000000u) return 0x04800000u - a;
     if ((address & 0xBFFF0000u) == 0x00010000u) return 0x00014000u - a;
     return 0;

@@ -505,6 +505,10 @@ static void poll_input(int *quit)
             ui_toggle();
             continue;
         }
+        if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F5 && !ev.key.repeat) {
+            plane_ui_toggle();
+            continue;
+        }
         if (ui_handle_event(&ev)) continue;
         switch (ev.type) {
         case SDL_EVENT_QUIT:

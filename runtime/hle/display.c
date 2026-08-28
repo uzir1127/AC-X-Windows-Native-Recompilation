@@ -1,4 +1,7 @@
 #include "hle.h"
+#include "modloader.h"
+#include "script.h"
+#include "acx_api.h"
 #include "sce_errors.h"
 #include "threadman.h"
 #include "../gpu/framedump.h"
@@ -141,6 +144,14 @@ void display_vblank(CpuCtx *c, u8 *ram)
 {
     g_vcount++;
     g_accumulated_hcount += PSP_LINES_PER_FRAME;
+    /* The context is published first so a tick can call into the game.
+     * script_tick runs the reload and the deferred `ready` pass before
+     * acx_api_tick fires "frame", so a frame handler cannot run ahead of its
+     * own ready handler on the first tick. */
+    acx_api_set_context(c, ram);
+    mod_tick(c, ram);
+    script_tick(c, ram);
+    acx_api_tick(c, ram);
     ge_set_frame(g_vcount);
     pace_frame();
     if (framedump_enabled())

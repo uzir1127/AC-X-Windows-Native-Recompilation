@@ -33,6 +33,12 @@ int  ui_render(void *cmd, uint32_t index);
 
 void ui_note_frame(double frame_ms);
 
+/* The parameter-table editor in ui_tableedit.cpp, on its own key so it can be
+ * open while the graphics menu is not. */
+void plane_ui_draw(void);
+void plane_ui_toggle(void);
+int  plane_ui_visible(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -109,6 +109,7 @@ RecompFn recomp_lookup(u32 addr)
          * QOL input overrides attach to table-dispatched functions.  The
          * override learns the original from this same call. */
         RecompFn ov = qol_override(addr, fn);
+        if (!ov) ov = mod_override(addr, fn);
         return ov ? ov : fn;
     }
     return NULL;

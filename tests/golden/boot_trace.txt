@@ -1,6 +1,8 @@
 [pspreco] loaded 3785392 bytes at guest 0x08804000
 [pspreco] 5292 recompiled functions
 [hle] bound 195/230 imports (35 still unimplemented)
+[table] watching Aircraft_Load (0886dbd8) for the live flight model
+[time] scaling ACX_FrameTimer_Update_DeltaProducer (089b3b34)
 [pspreco] entering module at 08804128
 [hle] sceKernelSetCompiledSdkVersion(0x02070010)  /* SDK 2.7.0.16 */
 [hle] sceKernelSetCompilerVersion(0x00030306)

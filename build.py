@@ -29,6 +29,7 @@ CFLAGS = [
     "-I", str(GEN),
     "-I", str(ROOT / "runtime" / "hle"),
     "-I", str(ROOT / "runtime" / "gpu"),
+    "-I", str(ROOT / "third_party" / "lua"),
 ]
 if os.name == "nt":
     # clang on Windows targets the MSVC CRT, which deprecates fopen et al.
@@ -69,8 +70,14 @@ BASISU_DEFS = [
 ]
 BASISU_CPP = [BASISU_DIR / "transcoder" / "basisu_transcoder.cpp"]
 BASISU_C   = [BASISU_DIR / "zstd" / "zstddeclib.c"]
+# Lua 5.4.9. Upstream's lua.c and luac.c are the standalone interpreter and
+# compiler and each carry a main(), so neither is vendored. -w because this is
+# unpatched upstream code.
+LUA_DIR = ROOT / "third_party" / "lua"
+LUA_C   = sorted(LUA_DIR.glob("*.c"))
 PER_SOURCE_FLAGS = {src: ["-std=c++17", "-w"] + BASISU_DEFS for src in BASISU_CPP}
 PER_SOURCE_FLAGS.update({src: ["-w"] for src in BASISU_C})
+PER_SOURCE_FLAGS.update({src: ["-w"] for src in LUA_C})
 PER_SOURCE_FLAGS[ROOT / "runtime" / "gpu" / "tex_ktx2.cpp"] = ["-std=c++17"] + BASISU_DEFS
 # The presenter is chosen at build time; exactly one of these is compiled.
 PRESENT_NULL  = ROOT / "runtime" / "host" / "present_null.c"
@@ -86,6 +93,7 @@ UI_SOURCES    = [
     IMGUI_DIR / "backends" / "imgui_impl_sdl3.cpp",
     IMGUI_DIR / "backends" / "imgui_impl_vulkan.cpp",
     ROOT / "runtime" / "host" / "ui_overlay.cpp",
+    ROOT / "runtime" / "host" / "ui_tableedit.cpp",
 ]
 # Only in a --trace build: runtime/cpu/trace.c is empty without PSPRECO_TRACE.
 TRACE_SOURCE = ROOT / "runtime" / "cpu" / "trace.c"
@@ -119,9 +127,22 @@ def main(argv: list[str]) -> int:
                          "variant: every recompiled function logs its entry "
                          "state. Separate objects and a separate executable, "
                          "so it never clobbers the normal build.")
+    # Moddable is the default. Routing direct calls through the dispatch table
+    # costs a load and an indirect branch per call, which measured under the
+    # noise floor of two 90-second runs. --no-moddable is kept for measuring
+    # that cost.
+    ap.add_argument("--no-moddable", dest="moddable", action="store_false",
+                    default=True,
+                    help="build WITHOUT the hook dispatch: direct calls in the "
+                         "recompiled C become direct C calls again, so no mod "
+                         "can replace a function the engine does not already "
+                         "reach through a pointer. For measuring the cost of "
+                         "the default; separate objects and executable.")
     a = ap.parse_args(argv)
 
-    suffix = ("-trace" if a.trace else "") + ("-sdl3" if a.sdl3 else "")
+    suffix = (("-trace" if a.trace else "")
+              + ("" if a.moddable else "-nomod")
+              + ("-sdl3" if a.sdl3 else ""))
     obj_dir = OBJ.with_name("obj" + suffix) if suffix else OBJ
     exe_name = "pspreco" + suffix
 
@@ -142,10 +163,14 @@ def main(argv: list[str]) -> int:
         return 2
 
     sources = (sorted(GEN.glob("*.c")) + RUNTIME_SOURCES + CPP_SOURCES
-               + BASISU_CPP + BASISU_C)
+               + BASISU_CPP + BASISU_C + LUA_C)
     if a.trace:
         extra = extra + ["-DPSPRECO_TRACE"]
         sources = sources + [TRACE_SOURCE]
+    if a.moddable:
+        # symbols.h reads this to route direct calls through g_func_ptr and to
+        # drop the const from it; see _CALL_MACRO in recomp/emit/emit_c.py.
+        extra = extra + ["-DPSPRECO_MODDABLE"]
 
     link_extra: list[str] = []
     if a.sdl3:

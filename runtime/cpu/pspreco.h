@@ -234,6 +234,11 @@ RecompFn recomp_lookup(u32 addr);
  * from cpu.c so the dispatcher keeps its function tables to itself; returns
  * NULL for every address that is not overridden, which is nearly all of them. */
 RecompFn qol_override(u32 addr, RecompFn orig);
+
+/* runtime/hle/modloader.c: same idea for the resource-registration callback,
+ * which the engine reaches only through a function pointer, so a mod can
+ * repoint a registry entry at its own bytes. */
+RecompFn mod_override(u32 addr, RecompFn orig);
 void     recomp_call_indirect(CpuCtx *c, u8 *ram, u32 pc, u32 target);
 
 /* Import thunks live in .sceStub.text; a call to one becomes a call to the

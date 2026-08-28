@@ -3,6 +3,11 @@
 #include "../hle/hle.h"
 #include "../hle/threadman.h"
 #include "../hle/iso9660.h"
+#include "../hle/modloader.h"
+#include "../hle/script.h"
+#include "../hle/datatables.h"
+#include "../hle/acx_api.h"
+#include "../hle/timectl.h"
 #include "../gpu/ge.h"
 #include "present.h"
 #include "settings.h"
@@ -252,6 +257,14 @@ int main(int argc, char **argv)
     ge_raster_init();
     present_gpu_init();
     hle_init();
+    /* Before the module runs, so replacements are staged in guest RAM before
+     * the first region registers anything. acx_api_init comes first because
+     * mod_init allocates out of the shared mod heap. */
+    acx_api_init();
+    mod_init(g_ram);
+    script_init();
+    table_init();
+    timectl_init();
     sysmem_set_partition_begin(ACEPSP_LOAD_BASE + (u32)sz);
     memset(&ctx, 0, sizeof ctx);
     ctx.r[R_GP] = ACEPSP_GP;
