@@ -2,8 +2,14 @@
 
 ## Original project
 
-- **sal063** — [Ace-Combat-X-Recompilation](https://github.com/sal063/Ace-Combat-X-Recompilation): the original static recompiler, native runtime/renderer, baseline F4 settings menu, controller input and right-stick camera support. This enhancement fork retains that project's history, license and notices.
-- This fork adds corrected native 60 FPS timing, direct ISO startup and portable packaging, modern input and rebinding, the F5 hardware readout, extended settings, font-pack compatibility and cinematic scaling/frame handling. These additions extend the original project.
+- **sal063** — [Ace-Combat-X-Recompilation](https://github.com/sal063/Ace-Combat-X-Recompilation): the original static recompiler, native runtime/renderer, baseline F4 settings menu, controller input and right-stick camera support. This enhancement project retains that project's history, license and notices.
+
+**A huge shout-out and thank-you to sal063 for the amazing work on the original recompilation. Their work is the foundation that made this version possible. Please visit and support the original project.**
+
+## This version
+
+- **uzir1127** — maintainer of this standalone repository and Windows release, including release integration, configuration, testing feedback and distribution.
+- This version adds corrected native 60 FPS timing, direct ISO startup and portable packaging, modern input and rebinding, the F5 hardware readout, extended settings, font-pack compatibility and cinematic scaling/frame handling. These additions extend sal063's original project.
 
 ## Texture and font artwork
 
@@ -14,11 +20,11 @@ The included **Ace Combat X HD Texture Pack v2.0.8** was created by **Ostrich / 
 - **UrvogelGallus** — Aquila Squadron emblem.
 - The pack author's additional acknowledgements: **Abbanon** for bug reports, the **/aceg/** community for feedback, **Rythus** for expertise, and the **PPSSPP team**. Ostrich's creation tools include **GIMP** and **Blender**.
 
-The artwork belongs to its credited creators. This fork changes font identity matching/filtering rather than claiming authorship of those images. Pack provenance and the original archive fingerprint are retained in `textures/ULUS10176/CREDITS.txt` in the Windows download. These credits do not relicense third-party artwork.
+The artwork belongs to its credited creators. This version changes font identity matching/filtering rather than claiming authorship of those images. Pack provenance and the original archive fingerprint are retained in `textures/ULUS10176/CREDITS.txt` in the Windows download. These credits do not relicense third-party artwork.
 
 ## Technical references
 
-- **Nukem9** — [acex-60fps-patch](https://github.com/Nukem9/acex-60fps-patch), used to cross-check documented mission/gun/cooldown locations. This fork uses native hooks rather than injecting that CWCheat patch.
+- **Nukem9** — [acex-60fps-patch](https://github.com/Nukem9/acex-60fps-patch), used to cross-check documented mission/gun/cooldown locations. This version uses native hooks rather than injecting that CWCheat patch.
 - **Foxvic** — the published Zero PC `dinputSample.ini` in [ACZeroPCremap](https://github.com/Foxvic/ACZeroPCremap), used as the functional input-layout reference. No remapper code is included.
 - **SDL_GameControllerDB contributors** — [mdqinc/SDL_GameControllerDB](https://github.com/mdqinc/SDL_GameControllerDB). The Windows subset preserves its original mapping lines and records the upstream blob. Its zlib license is bundled.
 
