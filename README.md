@@ -21,7 +21,7 @@ The ISO can have any filename. Keep one ISO inside the folder. **No Python, LLVM
 - Included **OstrichMods HD Texture Pack v2.0.8**, with recomp-specific font matching/filtering for clearer briefings, dialogue and UI. Artwork credits remain with the pack's creators.
 - Modern keyboard/mouse and controller defaults, plus F4 bindings for SDL gamepads, joysticks, HOTAS buttons, axes and hats. Separate devices can work together.
 - Extended **F4 settings** and **F5 performance overlay** with FPS/frame time and CPU/GPU names and utilization.
-- Direct ISO startup and a portable Windows package with matching source and license notices.
+- Direct ISO startup and a portable Windows package with matching source and license notices, no need to download LLVM or Python just drag and drop the ISO into the folder and it will work.
 
 sal063's original project already provided the recompiler, native runtime/renderer, baseline F4 menu, controller input and right-stick camera. This version extends those features.
 
