@@ -1,5 +1,7 @@
 #include "pspreco.h"
 #include "qol_input.h"
+#include "hooks.h"
+#include <stdio.h>
 #include "../host/present.h"
 
 #include <math.h>
@@ -35,6 +37,67 @@
 #define VIEW_CYCLE_TRIGGER 1
 
 QolCfg g_qol = { 1, 0, 100, 1, 1 };
+
+#define G_PLAYER_PTR 0x08a82ed8u
+#define G_YAW_AXIS   0x0887211cu
+static RecompFn s_orig_axis;
+static int s_rudder_ready;
+
+int qol_player_active(const u8 *ram)
+{
+    u32 player = mem_r32(ram, G_PLAYER_PTR);
+    return player >= 0x08800000u && player < 0x09fff000u;
+}
+
+int qol_modern_controls_active(void)
+{
+    return g_qol.modern_controls && s_rudder_ready;
+}
+
+u32 qol_shoulder_buttons(u32 base, int lb, int rb, int lt, int rt, int flying)
+{
+    if (!flying || !qol_modern_controls_active()) {
+        lt |= lb;
+        rt |= rb;
+    }
+    if (lt) base |= 1u << 8;
+    if (rt) base |= 1u << 9;
+    return base;
+}
+
+static void ov_yaw_axis(CpuCtx *c, u8 *ram)
+{
+    u32 flight = c->r[R_A1];
+    u32 aux = present_aux();
+    u32 saved;
+    if (!qol_modern_controls_active() || !qol_player_active(ram)
+        || c->r[R_A0] != mem_r32(ram, G_PLAYER_PTR)
+        || !(aux & (PRESENT_AUX_LB | PRESENT_AUX_RB))) {
+        s_orig_axis(c, ram);
+        return;
+    }
+    /* Positive ACX rudder input turns left. Feed the original normalized
+     * axis, preserving aircraft authority, rate limiter and frame delta.
+     * Both bumpers cancel. Never leave injected input latched. */
+    saved = mem_r32(ram, flight + 0x100u);
+    mem_wf32(ram, flight + 0x100u, present_rudder());
+    s_orig_axis(c, ram);
+    mem_w32(ram, flight + 0x100u, saved);
+}
+
+void qol_input_install(u8 *ram)
+{
+    if (s_rudder_ready) return;
+    qol_input_init();
+    /* Verified US executable: original YawAxis begins addiu sp,sp,-48. */
+    if (mem_r32(ram, G_YAW_AXIS) != 0x27bdffd0u
+        || hook_install(G_YAW_AXIS, ov_yaw_axis, &s_orig_axis) != HOOK_OK) {
+        fprintf(stderr, "[input] rudder hook unavailable; retaining PSP shoulders\n");
+        return;
+    }
+    s_rudder_ready = 1;
+    printf("[input] modern layout available: LB/RB yaw, LT/RT brake/accelerate\n");
+}
 
 void qol_input_init(void)
 {

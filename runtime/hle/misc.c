@@ -8,8 +8,11 @@
 #include "threadman.h"
 #include "../gpu/ge.h"
 #include "../host/present.h"
+#include "../host/video_clarity.h"
+#include "qol_input.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -137,6 +140,7 @@ void hle_sceDmacMemcpy(CpuCtx *c, u8 *ram)
     u32 dst = HLE_A0, src = HLE_A1, n = HLE_A2, i;
     static unsigned logged;
     for (i = 0; i < n; i++) mem_w8(ram, dst + i, (u8)mem_r8(ram, src + i));
+    mpeg_video_copy(dst,src,n);
     ge_gpu_vram_dirty(dst, n);
     if (logged < 4) {
         logged++;
@@ -349,6 +353,24 @@ static u32 autopress_mask(void)
  * hardware does. */
 #define CTRL_RING_SAMPLES 64
 
+/* Optional integration-test input. Unset in ordinary play. The test runner
+ * writes a PSP button mask plus analog bytes; no OS input is injected. */
+static void test_controller_state(u32 *buttons, u8 *lx, u8 *ly)
+{
+    const char *path = getenv("PSPRECO_TEST_INPUT");
+    unsigned mask, x = 128, y = 128;
+    FILE *f;
+    if (!path || !*path) return;
+    f = fopen(path, "r");
+    if (!f) return;
+    if (fscanf(f, "%x %u %u", &mask, &x, &y) >= 1) {
+        *buttons = mask;
+        *lx = (u8)(x > 255 ? 255 : x);
+        *ly = (u8)(y > 255 ? 255 : y);
+    }
+    fclose(f);
+}
+
 void hle_sceCtrlReadBufferPositive(CpuCtx *c, u8 *ram)
 {
     static u64 consumed_vblank;
@@ -374,8 +396,10 @@ void hle_sceCtrlReadBufferPositive(CpuCtx *c, u8 *ram)
 
     /* One host poll for all of them: the window only has the state it has. The
      * samples still carry distinct timestamps, one frame apart, as on hardware. */
-    buttons = present_buttons() | autopress_mask();
+    buttons = (qol_player_active(ram) ? present_flight_buttons() : present_buttons())
+            | autopress_mask();
     present_analog(&lx, &ly);
+    test_controller_state(&buttons, &lx, &ly);
 
     for (i = 0; i < count && p; i++) {
         u32 e = p + (u32)i * 16u;

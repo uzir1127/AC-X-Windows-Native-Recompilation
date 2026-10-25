@@ -1,0 +1,30 @@
+BUILDING THE INCLUDED SOURCE SNAPSHOT
+
+This snapshot contains the runtime, recompiler/tools, vendored libraries,
+and generated C/headers used by this Windows build. It excludes the ISO,
+BOOT/EBOOT files, initial RAM/data image, private captures, saves and binaries.
+The generated C and mod metadata are already present; you do not need the
+original local release executable to recover metadata again.
+
+Requirements: Python 3.10+, a C11/C++17 compiler, SDL3 and Vulkan headers/libs.
+The local build used LLVM-MinGW x86_64 UCRT and SDL3 3.4.18.
+Dependencies are development tools and are not needed by normal players.
+
+Windows example:
+  set PSPRECO_SDL3_PREFIX=C:\path\to\SDL-and-Vulkan-SDK
+  python build.py --sdl3 --cc C:\path\to\x86_64-w64-mingw32-clang.exe --jobs 8
+
+Copy the resulting build/pspreco-sdl3.exe beside the supplied SDL3.dll,
+font directory, Play.bat, gamecontrollerdb.txt, and your own supported US
+ULUS10176 ISO. The mapping database is in packaging/windows/.
+The default build supports native hooks. Do not use --no-moddable: the
+60 FPS and modern rudder fixes require routed calls.
+
+The GPU vertex/fragment shader arrays are included as runtime/gpu/*.inc.
+Generated native code expects the exact BOOT.BIN fingerprint checked by the
+ISO loader. To regenerate code from your own ISO, see README.txt and tools/.
+
+Upstream: https://github.com/sal063/Ace-Combat-X-Recompilation
+Local modifications dated 2026-10-25 include corrected 60 FPS/cinematic
+cadence, modern controls, direct ISO startup, F4 settings and Windows packaging.
+The uncapped renderer prototype is excluded from this release.

@@ -3,11 +3,14 @@
 #include "../hle/hle.h"
 #include "../hle/threadman.h"
 #include "../hle/iso9660.h"
+#include "../hle/boot_iso.h"
 #include "../hle/modloader.h"
 #include "../hle/script.h"
 #include "../hle/datatables.h"
 #include "../hle/acx_api.h"
 #include "../hle/timectl.h"
+#include "../hle/framerate.h"
+#include "../hle/qol_input.h"
 #include "../gpu/ge.h"
 #include "present.h"
 #include "settings.h"
@@ -22,6 +25,8 @@
 #else
 #  include <pthread.h>
 #  include <unistd.h>
+#  include <dirent.h>
+#  include <strings.h>
 #endif
 
 extern u8 *g_ram;
@@ -176,12 +181,57 @@ static void watchdog_start(void)
 
 u8 *g_ram;
 
+/* Portable startup never refers to an installation-specific path. The batch
+ * launcher sets the working directory; a double-clicked exe uses its own. */
+static int find_local_iso(char *path, size_t cap)
+{
+    int count=0;
+#if defined(_WIN32)
+    WIN32_FIND_DATAA info;
+    HANDLE h=FindFirstFileA("*.iso",&info);
+    if (h==INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)) {
+            if (strlen(info.cFileName)>=cap) { FindClose(h); return -1; }
+            snprintf(path,cap,"%s",info.cFileName); ++count;
+        }
+    } while (FindNextFileA(h,&info));
+    FindClose(h);
+#else
+    DIR *dir=opendir("."); struct dirent *ent;
+    if (!dir) return 0;
+    while ((ent=readdir(dir))) {
+        size_t n=strlen(ent->d_name);
+        if (n>4 && !strcasecmp(ent->d_name+n-4,".iso")) {
+            if (n>=cap) { closedir(dir); return -1; }
+            snprintf(path,cap,"%s",ent->d_name); ++count;
+        }
+    }
+    closedir(dir);
+#endif
+    return count;
+}
+
+static void default_env(const char *key,const char *value)
+{
+    const char *current=getenv(key);
+    if (current && *current) return;
+#if defined(_WIN32)
+    _putenv_s(key,value);
+#else
+    setenv(key,value,0);
+#endif
+}
+
 int main(int argc, char **argv)
 {
     const char *image_path = (argc > 1) ? argv[1] : "generated/image.bin";
     const char *env_iso = getenv("PSPRECO_ISO");
     const char *iso_path = (argc > 2) ? argv[2]
         : (env_iso && *env_iso) ? env_iso : "game.iso";
+    int direct_iso=argc==1 || !strcmp(argv[1],"--iso") || !strcmp(argv[1],"--check-iso");
+    int check_iso=argc>1 && !strcmp(argv[1],"--check-iso");
+    char discovered_iso[1024],error[512];
     FILE *fp;
     long sz;
     CpuCtx ctx;
@@ -190,9 +240,56 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+    if (argc>1 && (!strcmp(argv[1],"--help") || !strcmp(argv[1],"-h"))) {
+        puts("Ace Combat X recompilation\n"
+             "  Play.bat                 Launch the ISO beside Play\n"
+             "  pspreco-sdl3 --iso [ISO]  Launch an ISO (auto-detect if omitted)\n"
+             "  pspreco-sdl3 --check-iso [ISO]  Verify ISO without opening the game\n"
+             "  pspreco-sdl3 image.bin ISO     Legacy developer launch\n"
+             "F4: settings. Supports the original US release, ULUS10176.");
+        return 0;
+    }
+    if (direct_iso) {
+#if defined(_WIN32)
+        if (argc==1) {
+            char exe[4096],*slash;
+            DWORD n=GetModuleFileNameA(NULL,exe,sizeof exe);
+            if (n && n<sizeof exe && (slash=strrchr(exe,'\\'))) {
+                *slash=0; SetCurrentDirectoryA(exe);
+            }
+        }
+#endif
+        if (argc>2) iso_path=argv[2];
+        else {
+            int count=find_local_iso(discovered_iso,sizeof discovered_iso);
+            if (count!=1) {
+                fprintf(stderr,count==0
+                    ? "No game ISO found.\nDrop your US Ace Combat X ISO (ULUS10176) beside Play.bat, then open Play.\n"
+                    : "More than one ISO found.\nKeep one ISO beside Play.bat, or drag the chosen ISO onto Play.bat.\n");
+                return 2;
+            }
+            iso_path=discovered_iso;
+        }
+        if (!iso_mount(iso_path)) {
+            fprintf(stderr,"Cannot read ISO: %s\nUse a complete, uncompressed .iso file. CSO/PBP files are not supported.\n",iso_path);
+            return 2;
+        }
+        if (check_iso) {
+            u32 prepared=0;
+            u8 *image=(u8 *)malloc(4u*1024u*1024u);
+            int ok=image && boot_iso_load(image,4u*1024u*1024u,&prepared,error,sizeof error);
+            if (!ok) fprintf(stderr,"%s\n",image?error:"Not enough memory to verify the ISO.");
+            free(image); return ok?0:2;
+        }
+        default_env("PSPRECO_WATCHDOG_S","0");
+        default_env("PSPRECO_FONTDIR","font");
+        default_env("PSPRECO_MEMSTICK","memstick");
+    }
     gfx_settings_load();
+    /* An explicit developer override still wins over the saved F4 option. */
+    default_env("PSPRECO_FPS",g_gfx.native_60fps?"60":"30");
 
-    printf("[pspreco] build %s %s (60 FPS patch in), settings %s: "
+    printf("[pspreco] build %s %s, settings %s: "
            "res_scale=%d frameskip=%d speed=%d%%\n",
            __DATE__, __TIME__, gfx_settings_path(),
            g_gfx.res_scale, g_gfx.frameskip, g_gfx.speed_percent);
@@ -207,6 +304,14 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
         return ge_raster_selftest(g_ram) ? 1 : 0;
 
+    if (direct_iso) {
+        u32 prepared=0;
+        if (!boot_iso_load(g_ram+ACEPSP_LOAD_BASE,PSP_RAM_SIZE-ACEPSP_LOAD_BASE,
+                           &prepared,error,sizeof error)) {
+            fprintf(stderr,"%s\n",error); free(g_ram); return 2;
+        }
+        sz=(long)prepared;
+    } else {
     fp = fopen(image_path, "rb");
     if (!fp) {
         fprintf(stderr, "[pspreco] cannot open image %s\n"
@@ -218,7 +323,7 @@ int main(int argc, char **argv)
     fseek(fp, 0, SEEK_END);
     sz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    if (sz <= 0 || (u32)sz > PSP_RAM_SIZE) {
+    if (sz <= 0 || (u32)sz > PSP_RAM_SIZE-ACEPSP_LOAD_BASE) {
         fprintf(stderr, "[pspreco] implausible image size %ld\n", sz);
         fclose(fp);
         return 1;
@@ -229,11 +334,12 @@ int main(int argc, char **argv)
         return 1;
     }
     fclose(fp);
+    }
     printf("[pspreco] loaded %ld bytes at guest %#010x\n",
            sz, (unsigned)ACEPSP_LOAD_BASE);
     printf("[pspreco] %d recompiled functions\n", PSPRECO_FUNC_COUNT);
 
-    if (iso_mount(iso_path))
+    if (direct_iso || iso_mount(iso_path))
         printf("[pspreco] mounted UMD: %s\n", iso_path);
     else
         printf("[pspreco] WARNING: no UMD mounted (%s); disc0: reads will "
@@ -252,7 +358,7 @@ int main(int argc, char **argv)
     AddVectoredExceptionHandler(1, vh_first_chance);
 #endif
     watchdog_start();
-    present_init("pspreco -- Ace Combat X");
+    present_init("Ace Combat X - Skies of Deception");
     cpu_set_host_fpu_mode();
     ge_raster_init();
     present_gpu_init();
@@ -264,6 +370,8 @@ int main(int argc, char **argv)
     mod_init(g_ram);
     script_init();
     table_init();
+    framerate_init(g_ram);
+    qol_input_install(g_ram);
     timectl_init();
     sysmem_set_partition_begin(ACEPSP_LOAD_BASE + (u32)sz);
     memset(&ctx, 0, sizeof ctx);

@@ -16,8 +16,10 @@
  */
 
 #include "hle.h"
+#include "framerate.h"
 #include "threadman.h"
 #include "../host/h264_dec.h"
+#include "../host/video_clarity.h"
 #include "../host/at3_decode.h"
 #include "../gpu/ge.h"
 
@@ -67,6 +69,11 @@ typedef struct {
 
     H264Dec *h264;
     int h264_tried, h264_frames;
+    struct { u32 address, stride; int format, width, height; } surfaces[8];
+    unsigned surface_next;
+    u8 *held_video;
+    u32 held_bytes, held_stride;
+    int held_format;
     At3Handle *at3;
     /* demuxed ATRAC frame bytes (0F D0 framing, sync-scanned at decode) */
     u8 *afifo;
@@ -77,6 +84,59 @@ static Mpeg g_mpeg[8];
 static int g_mpeg_init;
 static u32 g_sid_gen = 1;
 static int g_log = -1;
+
+int mpeg_video_surface(uint32_t address, int format, uint32_t stride,
+                       int *width, int *height)
+{
+    if (!address || !stride) return 0;
+    for (unsigned i=0; i<8; ++i) {
+        const Mpeg *m=&g_mpeg[i];
+        if (!m->used || !m->h264_frames) continue;
+        for (unsigned j=0; j<8; ++j) {
+            if (m->surfaces[j].address &&
+                (address & PSP_ADDR_MASK)==(m->surfaces[j].address & PSP_ADDR_MASK) &&
+                format==m->surfaces[j].format && stride==m->surfaces[j].stride) {
+                *width=m->surfaces[j].width; *height=m->surfaces[j].height;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+void mpeg_video_copy(uint32_t destination, uint32_t source, uint32_t bytes)
+{
+    Mpeg *owner=NULL;
+    u32 pitch=0; int format=0,width=0,height=0;
+    u32 dst=destination & PSP_ADDR_MASK, src=source & PSP_ADDR_MASK;
+    for (unsigned i=0;i<8;++i) {
+        Mpeg *m=&g_mpeg[i];
+        if (!m->used || !m->h264_frames) continue;
+        for (unsigned j=0;j<8;++j) {
+            if (!m->surfaces[j].address) continue;
+            u32 start=m->surfaces[j].address & PSP_ADDR_MASK;
+            u32 size=m->surfaces[j].stride*m->surfaces[j].height*(m->surfaces[j].format==3?4u:2u);
+            if (src==start && bytes>=size) {
+                owner=m; pitch=m->surfaces[j].stride; format=m->surfaces[j].format;
+                width=m->surfaces[j].width; height=m->surfaces[j].height;
+            }
+        }
+    }
+    /* A later ordinary DMA overwrite must not inherit a stale movie tag. */
+    for (unsigned i=0;i<8;++i) for(unsigned j=0;j<8;++j) {
+        Mpeg *m=&g_mpeg[i];
+        u32 start=m->surfaces[j].address & PSP_ADDR_MASK;
+        u32 size=m->surfaces[j].stride*m->surfaces[j].height*(m->surfaces[j].format==3?4u:2u);
+        if (start && dst<start+size && start<dst+bytes) m->surfaces[j].address=0;
+    }
+    if (owner) {
+        unsigned j=8;
+        for (unsigned k=0;k<8;++k) if (!owner->surfaces[k].address) { j=k;break; }
+        if (j==8) j=owner->surface_next++ % 8;
+        owner->surfaces[j].address=destination; owner->surfaces[j].stride=pitch;
+        owner->surfaces[j].format=format; owner->surfaces[j].width=width; owner->surfaces[j].height=height;
+    }
+}
 
 static int mlog(void)
 {
@@ -100,9 +160,11 @@ static Mpeg *mpeg_find(u8 *ram, u32 mpegAddr)
 
 static void mpeg_free_ctx(Mpeg *m)
 {
+    if (m->used) framerate_movie_end();
     if (m->h264) h264_destroy(m->h264);
     if (m->at3) at3_close(m->at3);
     free(m->afifo);
+    free(m->held_video);
     memset(m, 0, sizeof *m);
 }
 
@@ -402,6 +464,7 @@ void hle_sceMpegCreate(CpuCtx *c, u8 *ram)
     if (!m) { HLE_RET(SCE_MPEG_ERROR_NO_MEMORY); return; }
     memset(m, 0, sizeof *m);
     m->used = 1;
+    framerate_movie_begin();
     m->handle = h;
     m->ringAddr = ringAddr;
     m->defaultFrameWidth = (int)frameWidth;
@@ -738,7 +801,44 @@ void hle_sceMpegAvcDecode(CpuCtx *c, u8 *ram)
         int eos = m->totalPackets && m->fedPackets >= m->totalPackets;
         gotFrame = h264_frame(m->h264, eos, ram + (buffer & PSP_ADDR_MASK),
                               (int)frameWidth, m->pixelMode);
-        if (gotFrame > 0) m->h264_frames++;
+        u32 bytes=video_buffer_bytes(frameWidth,m->pixelMode);
+        int usable=gotFrame>0;
+        if (gotFrame>0) {
+            if (m->held_bytes!=bytes) {
+                u8 *p=realloc(m->held_video,bytes);
+                if (p) { m->held_video=p; m->held_bytes=bytes; }
+                else m->held_bytes=0;
+            }
+            if (m->held_bytes==bytes) {
+                memcpy(m->held_video,ram+(buffer & PSP_ADDR_MASK),bytes);
+                m->held_stride=frameWidth; m->held_format=m->pixelMode;
+            }
+            m->h264_frames++;
+        } else if (m->held_bytes==bytes && m->held_stride==frameWidth &&
+                   m->held_format==m->pixelMode) {
+            /* The caller alternates buffers. Keeping the requested buffer
+             * unchanged would replay its older image when MF needs input.
+             * Hold the most recent successful image across every buffer. */
+            memcpy(ram+(buffer & PSP_ADDR_MASK),m->held_video,bytes);
+            usable=1;
+        }
+        if (usable) {
+            unsigned slot=8;
+            for (unsigned j=0;j<8;++j)
+                if (m->surfaces[j].address==buffer) { slot=j;break; }
+            if (slot==8)
+                for (unsigned j=0;j<8;++j) if (!m->surfaces[j].address) { slot=j;break; }
+            if (slot==8) slot=m->surface_next++ % 8;
+            m->surfaces[slot].address=buffer;
+            m->surfaces[slot].stride=frameWidth;
+            m->surfaces[slot].format=m->pixelMode;
+            {
+                int w=480,h=272;
+                h264_frame_dimensions(m->h264,&w,&h);
+                m->surfaces[slot].width=w>(int)frameWidth?(int)frameWidth:w;
+                m->surfaces[slot].height=h>272?272:h;
+            }
+        }
     }
     /* Before the first frame lands, clear instead of leaving stale bytes;
      * after that a miss keeps the previous frame (no black flicker). */

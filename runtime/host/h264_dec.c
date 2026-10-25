@@ -412,6 +412,13 @@ static int recv_frame(H264Dec *d, uint8_t *dst, int frameWidth, int pixelMode)
     return 1;
 }
 
+int h264_frame_dimensions(H264Dec *d, int *width, int *height)
+{
+    if (!d || d->out_w<=0 || d->out_h<=0) return 0;
+    *width=d->out_w; *height=d->out_h;
+    return 1;
+}
+
 int h264_frame(H264Dec *d, int eos, uint8_t *dst, int frameWidth,
                int pixelMode)
 {
@@ -454,6 +461,8 @@ int h264_frame(H264Dec *d, int eos, uint8_t *dst, int frameWidth,
 #else
 
 H264Dec *h264_create(void) { return NULL; }
+int h264_frame_dimensions(H264Dec *d, int *width, int *height)
+{ (void)d; (void)width; (void)height; return 0; }
 void h264_destroy(H264Dec *d) { (void)d; }
 void h264_feed(H264Dec *d, const uint8_t *data, uint32_t len)
 { (void)d; (void)data; (void)len; }

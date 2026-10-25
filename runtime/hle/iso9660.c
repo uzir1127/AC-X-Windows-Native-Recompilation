@@ -422,7 +422,7 @@ static int find_in_dir(s64 extent, s64 dir_size, const char *name, int name_len,
             pos = ((pos / SECTOR) + 1) * SECTOR;
             continue;
         }
-        if (pos + len > dir_size) break;
+        if (len < 34 || pos + len > dir_size || r[32] > len - 33) break;
         if (name_matches(r + 33, r[32], name, name_len)) {
             *out_extent = rd32le(r + 2);
             *out_size = rd32le(r + 10);

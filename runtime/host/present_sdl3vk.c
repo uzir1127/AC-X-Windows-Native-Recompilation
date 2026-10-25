@@ -1,5 +1,8 @@
 #include "present.h"
+#include "../hle/qol_input.h"
 #include "settings.h"
+#include "input_bindings.h"
+#include "video_clarity.h"
 #include "ui_overlay.h"
 #include "../gpu/ge.h"
 
@@ -20,6 +23,98 @@
 
 static SDL_Window      *s_win;
 static SDL_Gamepad     *s_pad;
+static SDL_Joystick    *s_raw_joy;
+typedef struct { SDL_JoystickID id; SDL_Gamepad *pad; SDL_Joystick *joy; } InputDevice;
+static InputDevice s_inputs[32];
+static int s_input_count;
+extern u8 *g_ram;
+
+static void input_devices_close(void)
+{
+    for (int i = 0; i < s_input_count; ++i) {
+        if (s_inputs[i].pad) SDL_CloseGamepad(s_inputs[i].pad);
+        else if (s_inputs[i].joy) SDL_CloseJoystick(s_inputs[i].joy);
+    }
+    s_input_count = 0;
+}
+
+static void input_devices_refresh(void)
+{
+    /* Keep every input device open between polls. Opening and closing a
+     * secondary pad each frame loses its translated trigger/axis updates. */
+    for (int i = 0; i < s_input_count;) {
+        InputDevice *d = &s_inputs[i];
+        if (!SDL_JoystickConnected(d->joy) || (!!d->pad != SDL_IsGamepad(d->id))) {
+            if (d->pad) SDL_CloseGamepad(d->pad); else SDL_CloseJoystick(d->joy);
+            *d = s_inputs[--s_input_count];
+        } else ++i;
+    }
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetJoysticks(&n);
+    for (int i = 0; ids && i < n && s_input_count < 32; ++i) {
+        int found = 0;
+        for (int j = 0; j < s_input_count; ++j) if (s_inputs[j].id == ids[i]) found = 1;
+        if (found) continue;
+        SDL_Gamepad *pad = SDL_IsGamepad(ids[i]) ? SDL_OpenGamepad(ids[i]) : NULL;
+        SDL_Joystick *joy = pad ? SDL_GetGamepadJoystick(pad) : SDL_OpenJoystick(ids[i]);
+        if (joy) s_inputs[s_input_count++] = (InputDevice){ids[i],pad,joy};
+    }
+    SDL_free(ids);
+}
+
+/* SDL uses physical face-button positions across Xbox/PS/Nintendo devices.
+ * An optional user SDL_GAMECONTROLLERCONFIG_FILE takes precedence over our
+ * bundled database. Never guess raw generic-joystick button/axis numbers. */
+static void input_setup(void)
+{
+    const char *base = SDL_GetBasePath();
+    char path[4096];
+    if (base && SDL_snprintf(path, sizeof path, "%sgamecontrollerdb.txt", base)
+                < (int)sizeof path)
+        SDL_SetHint(SDL_HINT_GAMECONTROLLERCONFIG_FILE, path);
+}
+
+static void input_select_pad(SDL_JoystickID preferred)
+{
+    SDL_Gamepad *next = NULL;
+    if (s_raw_joy && SDL_JoystickConnected(s_raw_joy)
+        && (!preferred || SDL_GetJoystickID(s_raw_joy) == preferred)) {
+        input_bindings_device(s_raw_joy); return;
+    }
+    if (s_pad && SDL_GamepadConnected(s_pad)
+        && (!preferred || SDL_GetGamepadID(s_pad) == preferred)) {
+        input_bindings_device(SDL_GetGamepadJoystick(s_pad)); return;
+    }
+    if (preferred) next = SDL_OpenGamepad(preferred);
+    if (!next && !preferred) {
+        int count = 0;
+        SDL_JoystickID *ids = SDL_GetJoysticks(&count);
+        /* Prefer standard gamepads at startup, then unmapped joysticks. */
+        for (int i = 0; ids && i < count && !next; ++i)
+            if (SDL_IsGamepad(ids[i])) next = SDL_OpenGamepad(ids[i]);
+        if (!next && ids && count) preferred = ids[0];
+        SDL_free(ids);
+    }
+    SDL_Joystick *raw = !next && preferred && !SDL_IsGamepad(preferred)
+                        ? SDL_OpenJoystick(preferred) : NULL;
+    if (next || raw || (!preferred && (!s_pad || !SDL_GamepadConnected(s_pad)))) {
+        if (s_pad) SDL_CloseGamepad(s_pad);
+        if (s_raw_joy) SDL_CloseJoystick(s_raw_joy);
+        s_pad = next;
+        s_raw_joy = raw;
+        input_bindings_device(s_pad ? SDL_GetGamepadJoystick(s_pad) : s_raw_joy);
+        if (next || raw) printf("[input] controller: %s\n", s_pad ? SDL_GetGamepadName(s_pad)
+                                                              : SDL_GetJoystickName(s_raw_joy));
+    }
+}
+
+const char *present_controller_name(void)
+{
+    const char *name = s_pad ? SDL_GetGamepadName(s_pad)
+                            : s_raw_joy ? SDL_GetJoystickName(s_raw_joy) : NULL;
+    return name ? name : "None connected";
+}
+void present_controller_select(unsigned id) { input_select_pad(id); }
 static VkInstance       s_inst;
 static VkSurfaceKHR     s_surf;
 static VkPhysicalDevice s_pdev;
@@ -58,10 +153,15 @@ static PresentSlot *slot_begin(void)
     return s;
 }
 
-static u32 s_buttons;
+static u32 s_buttons, s_flight_buttons;
 static u8  s_lx = 128, s_ly = 128;
 static u8    s_rx = 128, s_ry = 128;
 static float s_tl, s_tr;
+static float s_rudder;
+static float s_mouse_x, s_mouse_y, s_mouse_rx, s_mouse_ry;
+static Uint64 s_mouse_tick;
+static Uint64 s_key_until[SDL_SCANCODE_COUNT];
+static int s_was_flying, s_block_space, s_block_pad_back, s_block_mouse_back;
 static u32   s_aux;
 static int s_ready;
 float g_vk_max_aniso = 1.0f;
@@ -262,6 +362,7 @@ int present_init(const char *title)
     VkMemoryAllocateInfo mai;
     VkImageCreateInfo imi;
 
+    input_setup();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "[present] SDL_Init failed: %s\n", SDL_GetError());
         return 0;
@@ -392,15 +493,15 @@ int present_init(const char *title)
 
     memset(&bci, 0, sizeof bci);
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = (VkDeviceSize)PSP_W * PSP_H * 4;
+    bci.size = (VkDeviceSize)PSP_W * PSP_H * 16;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
     memset(&imi, 0, sizeof imi);
     imi.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imi.imageType = VK_IMAGE_TYPE_2D;
     imi.format = VK_FORMAT_B8G8R8A8_UNORM;
-    imi.extent.width = PSP_W;
-    imi.extent.height = PSP_H;
+    imi.extent.width = PSP_W * 2;
+    imi.extent.height = PSP_H * 2;
     imi.extent.depth = 1;
     imi.mipLevels = 1;
     imi.arrayLayers = 1;
@@ -461,12 +562,7 @@ int present_init(const char *title)
 
     if (!create_swapchain()) return 0;
 
-    if (SDL_HasGamepad()) {
-        int npads = 0;
-        SDL_JoystickID *ids = SDL_GetGamepads(&npads);
-        if (ids && npads > 0) s_pad = SDL_OpenGamepad(ids[0]);
-        SDL_free(ids);
-    }
+    input_select_pad(0);
     printf("[present] %ux%u swapchain, gamepad %s\n",
            s_swap_ext.width, s_swap_ext.height, s_pad ? "yes" : "no");
     s_ready = 1;
@@ -490,15 +586,42 @@ int present_init(const char *title)
 #define TRIG_DEADZONE 2600
 #define TRIG_DIGITAL_THRESHOLD 8192
 
+#ifdef PSPRECO_INPUT_TEST
+static const bool *s_test_keys;
+static int s_test_focus = -1;
+static int s_test_mouse;
+static float s_test_dx, s_test_dy, s_test_dt;
+#endif
+
+/* Equal/opposite actions cancel instead of depending on polling order. */
+static u8 action_axis(float negative, float positive)
+{
+    float v = positive - negative;
+    if (v > 1) v = 1; if (v < -1) v = -1;
+    return (u8)(128.0f + v * (v < 0 ? 128.0f : 127.0f) + 0.5f);
+}
+
 static void poll_input(int *quit)
 {
     SDL_Event ev;
     const bool *k;
+    bool combined[SDL_SCANCODE_COUNT];
     u32 b = 0;
     u8 lx = 128, ly = 128;
     u8 rx = 128, ry = 128;
     float tl = 0.0f, tr = 0.0f;
     u32 aux = 0;
+    int lb = 0, rb = 0, lt = 0, rt = 0;
+    /* US config +0x151 is the engine's menu/flight state (getter 08826fb0,
+     * setter 088216f8): 1 is active flight, 0 is the pause menu. The player
+     * and mission flags remain alive/unchanged while paused. */
+    int phase = g_ram ? mem_r8(g_ram, 0x08a82e08u) : 0;
+    int mission = g_ram && qol_player_active(g_ram) && (phase == 12 || phase == 22);
+    int flying = mission && mem_r8(g_ram, 0x08a80af4u + 0x151u) == 1;
+    int focused;
+    int entered_menu;
+    float keyboard[IA_COUNT] = {0}, controller[IA_COUNT] = {0}, mouse[IA_COUNT] = {0};
+    float yaw_l = 0, yaw_r = 0;
 
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F4 && !ev.key.repeat) {
@@ -506,19 +629,27 @@ static void poll_input(int *quit)
             continue;
         }
         if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F5 && !ev.key.repeat) {
+            ui_toggle_readout();
+            continue;
+        }
+        if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_F6 && !ev.key.repeat) {
             plane_ui_toggle();
             continue;
         }
+        if (input_bindings_event(&ev)) continue;
         if (ui_handle_event(&ev)) continue;
+        if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat
+            && ev.key.scancode > 0 && ev.key.scancode < SDL_SCANCODE_COUNT)
+            s_key_until[ev.key.scancode] = SDL_GetTicksNS() + 50000000;
         switch (ev.type) {
         case SDL_EVENT_QUIT:
             *quit = 1;
             break;
         case SDL_EVENT_KEY_DOWN:
-            if (ev.key.key == SDLK_ESCAPE) *quit = 1;
+            if (ev.key.key == SDLK_ESCAPE && !g_gfx.modern_keyboard) *quit = 1;
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
-            if (!s_pad) s_pad = SDL_OpenGamepad(ev.gdevice.which);
+            if (!s_pad) input_select_pad(ev.gdevice.which);
             break;
         case SDL_EVENT_GAMEPAD_REMOVED:
             if (s_pad && SDL_GetGamepadID(s_pad) == ev.gdevice.which) {
@@ -526,23 +657,124 @@ static void poll_input(int *quit)
                 s_pad = NULL;
             }
             break;
+        case SDL_EVENT_JOYSTICK_REMOVED:
+            if (s_raw_joy && SDL_GetJoystickID(s_raw_joy) == ev.jdevice.which) {
+                SDL_CloseJoystick(s_raw_joy); s_raw_joy = NULL;
+            }
+            break;
+        case SDL_EVENT_JOYSTICK_ADDED:
+            if (!s_pad && !s_raw_joy) input_select_pad(ev.jdevice.which);
+            break;
+        case SDL_EVENT_JOYSTICK_BUTTON_DOWN:
+            input_select_pad(ev.jbutton.which);
+            break;
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            /* Press a button to take over when several pads are connected. */
+            input_select_pad(ev.gbutton.which);
+            break;
         default:
             break;
         }
     }
 
     apply_window_settings();
+    input_devices_refresh();
+    input_select_pad(0);
+    focused = !s_win || (SDL_GetWindowFlags(s_win) & SDL_WINDOW_INPUT_FOCUS);
+#ifdef PSPRECO_INPUT_TEST
+    if (s_test_focus >= 0) focused = s_test_focus;
+#endif
 
-    if (ui_visible()) {
-        s_buttons = 0;
+    if (s_win) {
+        bool capture = flying && focused && g_gfx.mouse_flight && !ui_visible() && !plane_ui_visible();
+        if (SDL_GetWindowRelativeMouseMode(s_win) != capture)
+            SDL_SetWindowRelativeMouseMode(s_win, capture);
+    }
+    if (ui_visible() || plane_ui_visible() || !focused) {
+        s_buttons = s_flight_buttons = 0;
         s_lx = s_ly = 128;
         s_rx = s_ry = 128;
         s_tl = s_tr = 0.0f;
         s_aux = 0;
+        s_rudder = s_mouse_x = s_mouse_y = s_mouse_rx = s_mouse_ry = 0;
+        s_mouse_tick = 0;
+        if (!focused) input_bindings_cancel_capture();
+        SDL_GetRelativeMouseState(NULL, NULL);
+        input_bindings_release();
+        memset(s_key_until, 0, sizeof s_key_until);
         return;
     }
 
     k = SDL_GetKeyboardState(NULL);
+#ifdef PSPRECO_INPUT_TEST
+    if (s_test_keys) k = s_test_keys;
+#endif
+    /* The presenter may poll several times before the guest reads its pad.
+     * Keep short taps for 50 ms in host time, independent of render rate. */
+    Uint64 input_now = SDL_GetTicksNS();
+    for (int i = 0; i < SDL_SCANCODE_COUNT; ++i) combined[i] = k[i] || input_now < s_key_until[i];
+    k = combined;
+    entered_menu = s_was_flying && !flying;
+    s_was_flying = flying;
+    if (entered_menu && k[SDL_SCANCODE_SPACE]) s_block_space = 1;
+    if (!k[SDL_SCANCODE_SPACE]) s_block_space = 0;
+    /* A held throttle must not become Confirm as the pause menu opens. */
+    if (!flying && s_block_space) combined[SDL_SCANCODE_SPACE] = false;
+    if (g_gfx.modern_keyboard) {
+        if (flying) {
+            int look = k[SDL_SCANCODE_LALT] || k[SDL_SCANCODE_RALT];
+            input_bindings_values(IB_KEYBOARD, k, NULL, NULL, keyboard);
+            input_bindings_values(IB_MOUSE_DEVICE, NULL, NULL, NULL, mouse);
+            for (int a = 0; a < IA_COUNT; ++a)
+                if (mouse[a] > keyboard[a]) keyboard[a] = mouse[a];
+            if (!look) {
+                lx = action_axis(keyboard[IA_ROLL_L], keyboard[IA_ROLL_R]);
+                ly = action_axis(keyboard[IA_PITCH_DOWN], keyboard[IA_PITCH_UP]);
+            }
+            yaw_l = keyboard[IA_YAW_L]; yaw_r = keyboard[IA_YAW_R];
+            lb = yaw_l > 0; rb = yaw_r > 0;
+            lt = keyboard[IA_BRAKE] > 0; rt = keyboard[IA_ACCEL] > 0;
+            if (lt) tl = 1.0f;
+            if (rt) tr = 1.0f;
+            const u32 bits[] = {SCE_CTRL_CROSS,SCE_CTRL_CIRCLE,SCE_CTRL_SQUARE,SCE_CTRL_TRIANGLE,0,SCE_CTRL_SELECT,SCE_CTRL_START};
+            for (int a = IA_GUN; a <= IA_PAUSE; ++a) if (keyboard[a] > 0) b |= bits[a-IA_GUN];
+            if (keyboard[IA_VIEW]) aux |= PRESENT_AUX_R3;
+            if (k[SDL_SCANCODE_TAB]) b |= SCE_CTRL_SELECT;
+            rx = action_axis(keyboard[IA_LOOK_L] || (look && k[SDL_SCANCODE_A]),
+                             keyboard[IA_LOOK_R] || (look && k[SDL_SCANCODE_D]));
+            ry = action_axis(keyboard[IA_LOOK_UP] || (look && k[SDL_SCANCODE_W]),
+                             keyboard[IA_LOOK_DOWN] || (look && k[SDL_SCANCODE_S]));
+            if (keyboard[IA_DPAD_UP]) b |= SCE_CTRL_UP;
+            if (keyboard[IA_DPAD_DOWN]) b |= SCE_CTRL_DOWN;
+            if (keyboard[IA_DPAD_LEFT]) b |= SCE_CTRL_LEFT;
+            if (keyboard[IA_DPAD_RIGHT]) b |= SCE_CTRL_RIGHT;
+        } else {
+            if (k[SDL_SCANCODE_W]) b |= SCE_CTRL_UP;
+            if (k[SDL_SCANCODE_S]) b |= SCE_CTRL_DOWN;
+            if (k[SDL_SCANCODE_A]) b |= SCE_CTRL_LEFT;
+            if (k[SDL_SCANCODE_D]) b |= SCE_CTRL_RIGHT;
+            if (k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_KP_ENTER]
+                || k[SDL_SCANCODE_SPACE] || k[SDL_SCANCODE_J]) b |= SCE_CTRL_CROSS;
+            if (k[SDL_SCANCODE_BACKSPACE] || k[SDL_SCANCODE_L]) b |= SCE_CTRL_TRIANGLE;
+            if (k[SDL_SCANCODE_ESCAPE] && !mission) b |= SCE_CTRL_TRIANGLE;
+            if (k[SDL_SCANCODE_R] || k[SDL_SCANCODE_K]) b |= SCE_CTRL_SQUARE;
+            if (k[SDL_SCANCODE_Y] || k[SDL_SCANCODE_T]) b |= SCE_CTRL_TRIANGLE;
+            if (k[SDL_SCANCODE_Q]) b |= SCE_CTRL_LTRIGGER;
+            if (k[SDL_SCANCODE_E]) b |= SCE_CTRL_RTRIGGER;
+            if (k[SDL_SCANCODE_TAB] || k[SDL_SCANCODE_M]) b |= SCE_CTRL_SELECT;
+            input_bindings_values(IB_MOUSE_DEVICE, NULL, NULL, NULL, mouse);
+            if (mouse[IA_GUN]) b |= SCE_CTRL_CROSS;
+            if (entered_menu && mouse[IA_MISSILE]) s_block_mouse_back = 1;
+            if (!mouse[IA_MISSILE]) s_block_mouse_back = 0;
+            if (mouse[IA_MISSILE] && !s_block_mouse_back) b |= SCE_CTRL_TRIANGLE;
+        }
+        if ((mission && k[SDL_SCANCODE_ESCAPE])
+            || k[SDL_SCANCODE_F1]) b |= SCE_CTRL_START;
+        /* Enter starts/skips title movies without firing in actual flight. */
+        if (!mission && g_ram && k[SDL_SCANCODE_RETURN]
+            && (mem_r8(g_ram, 0x08a82e08u) == 6
+                || mem_r8(g_ram, 0x08a82e08u) == 21)) b |= SCE_CTRL_START;
+    } else {
     if (k[SDL_SCANCODE_RETURN])  b |= SCE_CTRL_START;
     if (k[SDL_SCANCODE_LSHIFT] || k[SDL_SCANCODE_RSHIFT])
                                  b |= SCE_CTRL_SELECT;
@@ -552,69 +784,89 @@ static void poll_input(int *quit)
     if (k[SDL_SCANCODE_S])       b |= SCE_CTRL_TRIANGLE;
     if (k[SDL_SCANCODE_Q])       b |= SCE_CTRL_LTRIGGER;
     if (k[SDL_SCANCODE_W])       b |= SCE_CTRL_RTRIGGER;
-    if (k[SDL_SCANCODE_UP])      b |= SCE_CTRL_UP;
-    if (k[SDL_SCANCODE_DOWN])    b |= SCE_CTRL_DOWN;
-    if (k[SDL_SCANCODE_LEFT])    b |= SCE_CTRL_LEFT;
-    if (k[SDL_SCANCODE_RIGHT])   b |= SCE_CTRL_RIGHT;
-
     if (k[SDL_SCANCODE_J])       rx = 0;
     if (k[SDL_SCANCODE_L])       rx = 255;
     if (k[SDL_SCANCODE_I])       ry = 0;
     if (k[SDL_SCANCODE_K])       ry = 255;
     if (k[SDL_SCANCODE_C])       aux |= PRESENT_AUX_R3;
-
-    if (s_pad) {
-#define PB(sdlb, bit) do { if (SDL_GetGamepadButton(s_pad, sdlb)) b |= (bit); \
-                      } while (0)
-        PB(SDL_GAMEPAD_BUTTON_SOUTH, SCE_CTRL_CROSS);
-        PB(SDL_GAMEPAD_BUTTON_EAST,  SCE_CTRL_CIRCLE);
-        PB(SDL_GAMEPAD_BUTTON_WEST,  SCE_CTRL_SQUARE);
-        PB(SDL_GAMEPAD_BUTTON_NORTH, SCE_CTRL_TRIANGLE);
-        PB(SDL_GAMEPAD_BUTTON_START, SCE_CTRL_START);
-        PB(SDL_GAMEPAD_BUTTON_BACK,  SCE_CTRL_SELECT);
-        PB(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,  SCE_CTRL_LTRIGGER);
-        PB(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, SCE_CTRL_RTRIGGER);
-        PB(SDL_GAMEPAD_BUTTON_DPAD_UP,    SCE_CTRL_UP);
-        PB(SDL_GAMEPAD_BUTTON_DPAD_DOWN,  SCE_CTRL_DOWN);
-        PB(SDL_GAMEPAD_BUTTON_DPAD_LEFT,  SCE_CTRL_LEFT);
-        PB(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SCE_CTRL_RIGHT);
-#undef PB
-        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIG_DIGITAL_THRESHOLD)
-            b |= SCE_CTRL_LTRIGGER;
-        if (SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIG_DIGITAL_THRESHOLD)
-            b |= SCE_CTRL_RTRIGGER;
-        {
-            int ax = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTX);
-            int ay = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFTY);
-            if (ax < -PAD_DEADZONE || ax > PAD_DEADZONE)
-                lx = (u8)((ax + 32768) * 255 / 65535);
-            if (ay < -PAD_DEADZONE || ay > PAD_DEADZONE)
-                ly = (u8)((ay + 32768) * 255 / 65535);
-        }
-        {
-            int ax = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHTX);
-            int ay = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHTY);
-            if (ax < -PAD_DEADZONE || ax > PAD_DEADZONE)
-                rx = (u8)((ax + 32768) * 255 / 65535);
-            if (ay < -PAD_DEADZONE || ay > PAD_DEADZONE)
-                ry = (u8)((ay + 32768) * 255 / 65535);
-        }
-        {
-            int at = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
-            int bt = SDL_GetGamepadAxis(s_pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
-            if (at > TRIG_DEADZONE)
-                tl = (float)(at - TRIG_DEADZONE) / (32767.0f - TRIG_DEADZONE);
-            if (bt > TRIG_DEADZONE)
-                tr = (float)(bt - TRIG_DEADZONE) / (32767.0f - TRIG_DEADZONE);
-            if (tl > 1.0f) tl = 1.0f;
-            if (tr > 1.0f) tr = 1.0f;
-        }
-        if (SDL_GetGamepadButton(s_pad, SDL_GAMEPAD_BUTTON_LEFT_STICK))
-            aux |= PRESENT_AUX_L3;
-        if (SDL_GetGamepadButton(s_pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK))
-            aux |= PRESENT_AUX_R3;
     }
-    s_buttons = b;
+    if (!flying || !g_gfx.modern_keyboard) {
+        if (k[SDL_SCANCODE_UP]) b |= SCE_CTRL_UP;
+        if (k[SDL_SCANCODE_DOWN]) b |= SCE_CTRL_DOWN;
+        if (k[SDL_SCANCODE_LEFT]) b |= SCE_CTRL_LEFT;
+        if (k[SDL_SCANCODE_RIGHT]) b |= SCE_CTRL_RIGHT;
+    }
+
+    if (s_pad || s_raw_joy) {
+        /* Separate USB stick/throttle/pedals can supply actions together.
+         * The F4 device selector chooses the profile to edit, not an input
+         * exclusivity lock. SDL keeps shared open-handle reference counts. */
+        for (int i = 0; i < s_input_count; ++i) {
+            InputDevice *d = &s_inputs[i];
+            float values[IA_COUNT];
+            input_bindings_values(IB_CONTROLLER, NULL, d->pad, d->joy, values);
+            for (int a = 0; a < IA_COUNT; ++a)
+                if (values[a] > controller[a]) controller[a] = values[a];
+        }
+        input_bindings_device(s_pad ? SDL_GetGamepadJoystick(s_pad) : s_raw_joy);
+        if (entered_menu && controller[IA_MISSILE] > .5f) s_block_pad_back = 1;
+        if (controller[IA_MISSILE] <= .5f) s_block_pad_back = 0;
+        if (!flying && s_block_pad_back) controller[IA_MISSILE] = 0;
+        const u32 bits[] = {SCE_CTRL_CROSS,flying ? SCE_CTRL_CIRCLE : SCE_CTRL_TRIANGLE,SCE_CTRL_SQUARE,SCE_CTRL_TRIANGLE,0,SCE_CTRL_SELECT,SCE_CTRL_START};
+        for (int a = IA_GUN; a <= IA_PAUSE; ++a) if (controller[a] > 0.5f) b |= bits[a-IA_GUN];
+        if (controller[IA_VIEW] > 0.5f) aux |= PRESENT_AUX_R3;
+        if (controller[IA_DPAD_UP] > 0.5f) b |= SCE_CTRL_UP;
+        if (controller[IA_DPAD_DOWN] > 0.5f) b |= SCE_CTRL_DOWN;
+        if (controller[IA_DPAD_LEFT] > 0.5f) b |= SCE_CTRL_LEFT;
+        if (controller[IA_DPAD_RIGHT] > 0.5f) b |= SCE_CTRL_RIGHT;
+        if (controller[IA_YAW_L] > yaw_l) yaw_l = controller[IA_YAW_L];
+        if (controller[IA_YAW_R] > yaw_r) yaw_r = controller[IA_YAW_R];
+        lb |= yaw_l > 0; rb |= yaw_r > 0;
+        lt |= controller[IA_BRAKE] > TRIG_DIGITAL_THRESHOLD / 32767.0f;
+        rt |= controller[IA_ACCEL] > TRIG_DIGITAL_THRESHOLD / 32767.0f;
+        float dead = TRIG_DEADZONE / 32767.0f;
+        float ctl = controller[IA_BRAKE] > dead ? (controller[IA_BRAKE] - dead) / (1 - dead) : 0;
+        float ctr = controller[IA_ACCEL] > dead ? (controller[IA_ACCEL] - dead) / (1 - dead) : 0;
+        if (ctl > tl) tl = ctl; if (ctr > tr) tr = ctr;
+        if (lx == 128) lx = action_axis(controller[IA_ROLL_L], controller[IA_ROLL_R]);
+        if (ly == 128) ly = action_axis(controller[IA_PITCH_DOWN], controller[IA_PITCH_UP]);
+        if (rx == 128) rx = action_axis(controller[IA_LOOK_L], controller[IA_LOOK_R]);
+        if (ry == 128) ry = action_axis(controller[IA_LOOK_UP], controller[IA_LOOK_DOWN]);
+        if (s_pad && SDL_GetGamepadButton(s_pad, SDL_GAMEPAD_BUTTON_LEFT_STICK)) aux |= PRESENT_AUX_L3;
+    }
+    {
+        float dx = 0, dy = 0;
+        Uint64 now = SDL_GetTicksNS();
+        float dt = s_mouse_tick ? (now - s_mouse_tick) / 1.0e9f : 1.0f / 60.0f;
+        s_mouse_tick = now;
+        SDL_GetRelativeMouseState(&dx, &dy);
+#ifdef PSPRECO_INPUT_TEST
+        if (s_test_mouse) { dx = s_test_dx; dy = s_test_dy; dt = s_test_dt; }
+#endif
+        if (dt < .001f) dt = .001f; if (dt > .1f) dt = .1f;
+        if (flying && g_gfx.mouse_flight) {
+            float gain = g_gfx.mouse_sensitivity / 100.0f;
+            float mx = dx * gain / (dt * 900.0f), my = dy * gain / (dt * 900.0f);
+            if (mx > 1) mx = 1; if (mx < -1) mx = -1;
+            if (my > 1) my = 1; if (my < -1) my = -1;
+            float smoothing = 1.0f - expf(-dt / .04f);
+            int look = k[SDL_SCANCODE_LALT] || k[SDL_SCANCODE_RALT];
+            s_mouse_x += ((look ? 0 : mx) - s_mouse_x) * smoothing;
+            s_mouse_y += ((look ? 0 : my) - s_mouse_y) * smoothing;
+            s_mouse_rx += ((look ? mx : 0) - s_mouse_rx) * smoothing;
+            s_mouse_ry += ((look ? my : 0) - s_mouse_ry) * smoothing;
+            if (!look && lx == 128 && fabsf(s_mouse_x) > .01f) lx = action_axis(0, s_mouse_x);
+            if (!look && ly == 128 && fabsf(s_mouse_y) > .01f) ly = action_axis(0, s_mouse_y);
+            if (look && rx == 128) rx = action_axis(0, s_mouse_rx);
+            if (look && ry == 128) ry = action_axis(0, s_mouse_ry);
+        } else s_mouse_x = s_mouse_y = s_mouse_rx = s_mouse_ry = 0;
+    }
+    if (lb && flying) aux |= PRESENT_AUX_LB;
+    if (rb && flying) aux |= PRESENT_AUX_RB;
+    /* Keep PSP shoulder navigation in menus; yaw remains independent from
+     * throttle in flight. Keyboard and controller actions combine. */
+    s_buttons = qol_shoulder_buttons(b, lb, rb, lt, rt, 0);
+    s_flight_buttons = qol_shoulder_buttons(b, lb, rb, lt, rt, flying);
     s_lx = lx;
     s_ly = ly;
     s_rx = rx;
@@ -622,9 +874,12 @@ static void poll_input(int *quit)
     s_tl = tl;
     s_tr = tr;
     s_aux = aux;
+    s_rudder = flying ? yaw_l - yaw_r : 0;
+    input_bindings_end_poll();
 }
 
 u32 present_buttons(void) { return s_buttons; }
+u32 present_flight_buttons(void) { return s_flight_buttons; }
 
 void present_analog(u8 *lx, u8 *ly)
 {
@@ -645,6 +900,7 @@ void present_triggers(float *lt, float *rt)
 }
 
 u32 present_aux(void) { return s_aux; }
+float present_rudder(void) { return s_rudder; }
 
 static void barrier(VkCommandBuffer cmd, VkImage img,
                     VkImageLayout from, VkImageLayout to,
@@ -771,6 +1027,17 @@ int present_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
 
     slot = slot_begin();
     convert_frame(slot->staging_map, ram, addr, stride, fpf, w, h);
+    {
+        int mw=0, mh=0;
+        if (g_gfx.movie_clarity && mpeg_video_surface(addr,fpf,stride,&mw,&mh)
+            && mw>=w && mh>=h) {
+            static uint32_t movie_pixels[PSP_W*PSP_H*4];
+            static uint32_t movie_tmp[PSP_W*PSP_H*2];
+            video_upscale2x(slot->staging_map,w,w,h,movie_pixels,w*2,h*2,movie_tmp);
+            w*=2; h*=2;
+            memcpy(slot->staging_map,movie_pixels,(size_t)w*h*4);
+        }
+    }
 
     for (attempt = 0; attempt < 2; attempt++) {
         uint32_t idx = 0;
@@ -1095,9 +1362,38 @@ void present_shutdown(void)
         s_dbg = VK_NULL_HANDLE;
     }
     if (s_inst) vkDestroyInstance(s_inst, NULL);
+    input_bindings_save();
+    input_devices_close();
     if (s_pad) SDL_CloseGamepad(s_pad);
+    if (s_raw_joy) SDL_CloseJoystick(s_raw_joy);
+    s_pad = NULL; s_raw_joy = NULL;
     if (s_win) SDL_DestroyWindow(s_win);
     SDL_Quit();
     s_dev = VK_NULL_HANDLE;
     s_ready = 0;
 }
+
+#ifdef PSPRECO_INPUT_TEST
+/* In-process SDL virtual-controller test seam; absent from production builds.
+ * No OS input is synthesized. Run the exact production polling/mapping path. */
+void present_test_poll(SDL_JoystickID id)
+{
+    int quit = 0;
+    if (id) input_select_pad(id);
+    poll_input(&quit);
+}
+void present_test_keys(const bool *keys) { s_test_keys = keys; }
+void present_test_focus(int focused) { s_test_focus = focused; }
+void present_test_input_setup(void) { input_setup(); }
+void present_test_mouse(float dx, float dy, float dt)
+{
+    s_test_mouse = 1; s_test_dx = dx; s_test_dy = dy; s_test_dt = dt;
+}
+void present_test_input_shutdown(void)
+{
+    input_devices_close();
+    if (s_pad) SDL_CloseGamepad(s_pad);
+    if (s_raw_joy) SDL_CloseJoystick(s_raw_joy);
+    s_pad = NULL; s_raw_joy = NULL;
+}
+#endif

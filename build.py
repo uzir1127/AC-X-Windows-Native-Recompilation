@@ -93,6 +93,8 @@ UI_SOURCES    = [
     IMGUI_DIR / "backends" / "imgui_impl_sdl3.cpp",
     IMGUI_DIR / "backends" / "imgui_impl_vulkan.cpp",
     ROOT / "runtime" / "host" / "ui_overlay.cpp",
+    ROOT / "runtime" / "host" / "input_bindings.c",
+    ROOT / "runtime" / "host" / "hardware_stats.cpp",
     ROOT / "runtime" / "host" / "ui_tableedit.cpp",
 ]
 # Only in a --trace build: runtime/cpu/trace.c is empty without PSPRECO_TRACE.
@@ -214,6 +216,8 @@ def main(argv: list[str]) -> int:
     objs: list[Path] = []
     failures = 0
     warnings = 0
+    # Create the shared output directory before workers start (Windows mkdir race).
+    obj_dir.mkdir(parents=True, exist_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as pool:
         futs = []
         for src in sources:

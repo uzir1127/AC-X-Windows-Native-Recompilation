@@ -18,6 +18,45 @@ This repository does not include:
   - The game's disc image, extracted files, or any asset archive.
 
 
+Portable Windows download
+-------------------------
+End users need a prebuilt portable Windows package: extract it, drop an original
+US ULUS10176 ISO beside Play.bat, then open Play. F4 opens Settings, including
+physics-aware 60 FPS gameplay (restart to switch to/from 30 FPS), graphics, and
+modern Xbox controls. No Python, compiler, extracted disc, or image.bin is needed.
+F5 toggles FPS/frame time and detected CPU/GPU names with utilization percentages.
+The portable texture pack includes exact recomp PGF-page aliases and targeted
+font filtering for clearer small text in briefings, dialogue and menus.
+Font aliases match the bitmap and palette independently of its memory address.
+F4 > Renderer > Cinematic clarity enables a 2x cubic upscale of decoded movie
+frames, including their rotating DMA display copies. It is enabled by default.
+Only live MPEG surfaces qualify; context release/ordinary overwrites remove the
+tag. It changes no video timestamps, audio clocks or gameplay timing. Movies
+retain the detail present in the original ISO; this is a playback filter.
+The ISO is read-only. Saves/settings stay in the portable folder.
+
+The GitHub source-only Download ZIP is for developers and cannot run without a
+compiled executable. A maintainer builds the SDL3 runtime, then makes the
+ready-to-run download with:
+
+    python tools/package_windows.py --out "dist/Ace Combat X - Portable Starter" \
+        --sdl path/to/SDL3.dll --sdl-license path/to/SDL3/LICENSE.txt --zip
+
+The packager uses a fixed file allowlist. It never includes the ISO, extracted
+image, local saves/settings, mods, debug captures, or optional HD texture packs unless explicitly supplied with
+--texture-pack path/to/ULUS10176.
+It refuses to overwrite an existing installation. Publish the portable ZIP
+alongside the corresponding source/build instructions; this command does not
+upload anything or create a GitHub release.
+
+Native startup also accepts `pspreco-sdl3 --iso path/to/game.iso`; omit the path
+to auto-detect one local ISO. `--check-iso` validates without opening a window.
+It verifies BOOT.BIN's SHA-256, checks the original archive extent, and applies
+PRX relocations in RAM using the same semantics as tools/prxload. Missing,
+ambiguous, truncated, or unsupported executable/layout checks fail before
+gameplay. The developer
+`image.bin ISO` launch remains available.
+
 Layout
 ------
 recomp/          the static recompiler: ELF/PRX analysis, function-boundary
@@ -117,6 +156,12 @@ repository root as EBOOT.elf.
 
        python tools/prxload/prxload.py EBOOT.elf --emit-image generated/image.bin
 
+4a. The mod-enabled runtime also needs metadata omitted from the upstream tree.
+    Recover it from the original symbol-bearing local release executable after
+    emit_c.py, which empties generated/:
+
+        python tools/recover_mod_metadata.py --exe ORIGINAL/pspreco-sdl3.exe --out generated
+
 5. Compile:
 
        python build.py               # headless, software-rasterised
@@ -134,6 +179,116 @@ directory (see "Extracting your own copy of the game" above); it defaults to
 game.iso in the current directory if omitted. PSPRECO_ISO also works as an
 environment variable if you'd rather not pass it on the command line.
 
+
+Native 60 FPS
+-------------
+The portable Windows build defaults to corrected 60 FPS. F4 can select
+original 30 FPS after a restart. PSPRECO_FPS=60 explicitly enables native
+updates and rendering at PSP refresh
+(about 59.94 FPS). Keep throttle on, speed_percent=100, and frameskip=0.
+
+This retains the kernel/display/audio clock, changes the engine's divide-by-two
+frame gate, reuses the vblank wait already completed by the main render path,
+and computes the shared simulation delta from guest vblanks. Delta, rounded
+delta, and reciprocal are updated together so countdowns and physics agree.
+The original maximum-delta clamp is retained. Encoded cinematic playback keeps
+its original 29.97 FPS main-buffer cadence while any MPEG context is active;
+otherwise alternating movie buffers can replay older images. The last context
+cleanup restores 60 FPS automatically. Timer and divider phase are reset at
+both transitions to avoid a time jump. Unsupported images or unavailable
+hooks leave 60 FPS disabled. PSPRECO_FPS=30 keeps the original timing path.
+
+Original frame-counted mission scripts, NPC simulation, the player gun, and
+button-hold/ramp handlers retain a fixed 30 Hz step inside the 60 Hz frame loop.
+NPC init, rendering and damage messages still run immediately. Legacy steps use
+the original two-tick shared delta and 30 FPS normalization locally, restore
+both afterwards, and carry odd
+vblanks forward. Missile/special rack reloads carry the integer half ticks that
+would otherwise truncate to zero at 60 Hz. BankTurn retains the original sink
+velocity normalization. The shared angular rate limiter retains its original
+30 Hz acceleration/damping response, resolving velocity at the beginning of
+each legacy interval while its callers integrate movement on both 60 Hz halves.
+
+Tests: tests/framerate_regression.c exercises the actual timing module with a
+controlled guest clock, including fixed legacy steps, rack tick carry, draw and
+non-update messages, stall catch-up, timer/FPS restoration and movie transitions.
+tests/speed_integrator_regression.c compares captured flight integration at
+30 x 2 ticks and 60 x 1 tick. tests/gravity_regression.c exercises the original
+movement and BankTurn functions for low-speed sink and bank cases. The tests
+contain no game snapshots; provide locally captured inputs yourself.
+tests/axis_regression.c links the actual native hooks and original pitch/yaw/roll
+functions, with a controlled guest clock, across 36 captured-state cases.
+After an SDL3 moddable build, run all checks on Windows with LLVM-MinGW:
+
+    python tests/build_native60_checks.py --cc <clang.exe> --sdk <SDL-Vulkan-prefix> --cpu <local-cpu.bin> --ram <local-32MB-ram.bin>
+
+The capture is an 800-byte CpuCtx at entry to Player_SpeedIntegrator plus
+guest RAM 0x08000000..0x0a000000. These private game-data captures are not
+distributed. Results are written under build/native60-checks/.
+
+The mission/gun/cooldown frame-count paths were cross-checked against the MIPS
+locations documented by Nukem9 (https://github.com/Nukem9/acex-60fps-patch).
+This implementation uses native C hooks rather than injecting that CWCheat patch.
+
+
+
+Modern input controls
+--------------------
+Modern shoulder controls are enabled by default in this build:
+LB/RB yaw left/right; LT/RT brake/accelerate. Left stick pitch/roll, right
+stick camera, Menu pause and View radar/map retain their mappings. A/B/X/Y
+weapon/target controls are unchanged; R3 still changes view.
+
+F4 > Input > Modern shoulder controls toggles back to the original PSP
+shoulder mapping. The setting persists as [input] modern_controls = true/false.
+It replaces the former analog_yaw setting, which had no implementation.
+Menus keep PSP shoulder navigation on both bumpers and triggers.
+
+Bumpers supply the original normalized player rudder axis. The original
+YawAxis function retains aircraft authority, damping and frame timing;
+its input is restored after each call. Opposed bumpers cancel, release
+returns to the original neutral response, NPCs are unaffected, and yaw
+can be used while braking/accelerating. If the verified hook cannot be
+installed, controller mapping falls back to PSP shoulders.
+
+tests/controls_regression.c checks mapping, input restoration and actual
+original yaw physics at 30/60 FPS. tests/controller_mapping_regression.c
+uses an in-process SDL virtual controller to exercise production polling,
+including both shoulder pairs, face buttons, Menu/View, sticks, dead zones,
+the layout toggle and disconnect release. Its polling seam is compiled
+only with PSPRECO_INPUT_TEST; normal builds have no virtual-controller code.
+Both checks run with tests/build_native60_checks.py alongside the 60 FPS tests.
+
+The Zero-style modern keyboard preset adds real analog pitch/roll on WASD,
+Q/E yaw, Ctrl/Space brake/accelerate, J/L/K/T gun/missile/weapon/target,
+V view, M radar and Esc pause. Menu keys are separate, including Enter/Space
+confirm. F1 always supplies Start/skip. F4 can restore the legacy preset.
+Mouse flight uses relative movement normalized by elapsed host time, with a
+40 ms smoothing time constant; Alt changes to camera look. Buttons/wheel
+match the default Zero-style actions. Mouse flight is independently optional.
+Functional reference: Foxvic/ACZeroPCremap's published dinputSample.ini.
+
+runtime/host/input_bindings.c handles rebindable keyboard/mouse actions and
+per-GUID SDL joystick profiles. Standard gamepads retain semantic SDL
+position mappings. Raw joystick/HOTAS buttons, axes and hats can be captured
+in F4 > Input; full-range/reversed axes are selectable for throttle levers.
+Centered pitch/roll/rudder are proportional. ACX throttle remains its original
+digital brake/accelerate behavior, even when driven by a lever. Connected
+USB stick/throttle/pedal devices can contribute actions simultaneously.
+Bindings persist atomically to controls.ini beside pspreco.toml. Keyboard
+menus remain usable with an unmapped device. Focus loss and F4/F6 clear game
+input; controller removal releases held input and selects an available device.
+Unsupported hardware still needs a Windows/SDL driver or mapping.
+
+packaging/windows/gamecontrollerdb.txt is a Windows-only subset of
+https://github.com/mdqinc/SDL_GameControllerDB with its original mapping lines
+and license retained. Place it beside the executable; an explicit environment
+SDL_GAMECONTROLLERCONFIG_FILE overrides it. The portable packager includes it.
+Input tests cover SDL mapping parsing, keyboard/menu/pause/aux contexts,
+30/60 Hz mouse response, remapping, profiles/save replacement, two different
+gamepad raw layouts, unmapped HOTAS axes/buttons/hats, multiple-device mixing,
+disconnect/focus release and original 30/60 FPS rudder at fractional strength.
+These virtual-device tests do not certify every physical controller/driver.
 
 Replacement textures
 ---------------------

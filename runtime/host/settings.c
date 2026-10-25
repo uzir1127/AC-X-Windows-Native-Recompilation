@@ -15,7 +15,7 @@ void gfx_settings_touch(void)
     g_qol.rstick_cam    = g_gfx.rstick_cam;
     g_qol.rstick_invert = g_gfx.rstick_invert;
     g_qol.rstick_sens   = g_gfx.rstick_sens;
-    g_qol.analog_yaw    = g_gfx.analog_yaw;
+    g_qol.modern_controls    = g_gfx.modern_controls;
     g_qol.r3_view       = g_gfx.r3_view;
     qol_input_init();
 }
@@ -42,6 +42,7 @@ static const Field k_fields[] = {
 
     F("pacing", "throttle",        T_BOOL,  throttle,         0, 1),
     F("pacing", "speed_percent",   T_INT,   speed_percent,   25, 800),
+    F("pacing", "native_60fps", T_BOOL, native_60fps, 0, 1),
     F("pacing", "frameskip",       T_INT,   frameskip,        0, 5),
     F("pacing", "show_fps",        T_BOOL,  show_fps,         0, 1),
     F("pacing", "show_stats",      T_BOOL,  show_stats,       0, 1),
@@ -52,6 +53,7 @@ static const Field k_fields[] = {
     F("render", "anisotropy",      T_INT,   anisotropy,       1, 16),
     F("render", "rtt",             T_BOOL,  rtt,              0, 1),
     F("render", "tex_replace",     T_BOOL,  tex_replace,      0, 1),
+    F("render", "movie_clarity",   T_BOOL,  movie_clarity,    0, 1),
 
     F("ge",     "fog",             T_INT,   fog,              0, 2),
     F("ge",     "lighting",        T_INT,   lighting,         0, 2),
@@ -74,7 +76,11 @@ static const Field k_fields[] = {
     F("input",  "rstick_cam",      T_BOOL,  rstick_cam,       0, 1),
     F("input",  "rstick_invert",   T_BOOL,  rstick_invert,    0, 1),
     F("input",  "rstick_sens",     T_INT,   rstick_sens,     10, 400),
-    F("input",  "analog_yaw",      T_BOOL,  analog_yaw,       0, 1),
+    F("input",  "modern_controls",      T_BOOL,  modern_controls,       0, 1),
+    F("input",  "modern_keyboard", T_BOOL, modern_keyboard, 0, 1),
+    F("input",  "mouse_flight", T_BOOL, mouse_flight, 0, 1),
+    F("input",  "mouse_sensitivity", T_INT, mouse_sensitivity, 10, 400),
+    F("input",  "deadzone", T_INT, input_deadzone, 0, 50),
     F("input",  "r3_view",         T_BOOL,  r3_view,          0, 1),
 
     F("colour", "brightness",      T_FLOAT, brightness,    -0.5f, 0.5f),
@@ -124,11 +130,17 @@ void gfx_settings_defaults(void)
     g_gfx.present_mode   = PRESENT_MAILBOX;
     g_gfx.throttle       = 1;
     g_gfx.speed_percent  = 100;
+    g_gfx.native_60fps   = 1;
     g_gfx.res_scale      = 1;
     g_gfx.mipmaps_on     = 1;
     g_gfx.anisotropy     = 1;
     g_gfx.rtt            = 1;
     g_gfx.tex_replace    = 1;
+    g_gfx.movie_clarity  = 1;
+    g_gfx.modern_keyboard = 1;
+    g_gfx.mouse_flight = 1;
+    g_gfx.mouse_sensitivity = 100;
+    g_gfx.input_deadzone = 24;
     g_gfx.fog_distance   = 1.0f;
     g_gfx.fog_start      = 1.0f;
     g_gfx.contrast       = 1.0f;
@@ -136,7 +148,7 @@ void gfx_settings_defaults(void)
     g_gfx.gamma          = 1.0f;
     g_gfx.rstick_cam     = 1;
     g_gfx.rstick_sens    = 100;
-    g_gfx.analog_yaw     = 1;
+    g_gfx.modern_controls     = 1;
     g_gfx.r3_view        = 1;
     gfx_settings_touch();
 }
@@ -165,7 +177,7 @@ static const Preset k_presets[4] = {
                          OVR_GAME, OVR_GAME, OVR_GAME, SHADE_GAME },
     [PRESET_MEDIUM] = {  1, TEXF_GAME,  1, 0,  1,  1,
                          OVR_GAME, OVR_GAME, OVR_GAME, SHADE_GAME },
-    [PRESET_LOW]    = {  1, TEXF_GAME,  0, 1,  0,  1,
+    [PRESET_LOW]    = {  1, TEXF_GAME,  0, 0,  0,  1,
                          OVR_OFF,  OVR_OFF,  OVR_OFF,  SHADE_FLAT },
 };
 
@@ -244,8 +256,11 @@ int gfx_settings_save(void)
         }
         }
     }
-    fclose(f);
-    return 1;
+    {
+        int ok = !ferror(f);
+        if (fclose(f) != 0) ok = 0;
+        return ok;
+    }
 }
 
 static char *trim(char *s)

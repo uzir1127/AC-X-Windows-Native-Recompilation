@@ -1,0 +1,22 @@
+# Portable starter defaults. F4 saves all settings to this file.
+[output]
+fullscreen = false
+window_scale = 2
+[pacing]
+native_60fps = true
+throttle = true
+speed_percent = 100
+frameskip = 0
+show_fps = false
+[render]
+res_scale = 2
+anisotropy = 8
+movie_clarity = true
+[input]
+modern_controls = true
+modern_keyboard = true
+mouse_flight = true
+mouse_sensitivity = 100
+deadzone = 24
+rstick_cam = true
+r3_view = true

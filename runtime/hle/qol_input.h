@@ -9,12 +9,16 @@ typedef struct {
     int   rstick_cam;
     int   rstick_invert;
     int   rstick_sens;
-    int   analog_yaw;
+    int   modern_controls;
     int   r3_view;
 } QolCfg;
 
 extern QolCfg g_qol;
 
 void qol_input_init(void);
+void qol_input_install(u8 *ram);
+int  qol_player_active(const u8 *ram);
+int  qol_modern_controls_active(void);
+u32  qol_shoulder_buttons(u32 base, int lb, int rb, int lt, int rt, int flying);
 
 #endif

@@ -1,6 +1,7 @@
 /* Global time scaling; see timectl.h. */
 
 #include "timectl.h"
+#include "framerate.h"
 #include "hooks.h"
 #include "hle.h"
 #include "acx_symbols.h"
@@ -38,6 +39,7 @@ static void ov_frame_timer(CpuCtx *c, u8 *ram)
     u32 t = c->r[R_A0];
 
     if (s_orig) s_orig(c, ram);
+    framerate_update_delta(ram, t);
     s_ticks++;
     /* The scale applies to the whole game, menu timers included, so freezing
      * from boot stops the frontend too.  PSPRECO_TIME_AFTER holds off until a

@@ -26,6 +26,7 @@ int  ui_handle_event(const void *sdl_event);
 
 int  ui_visible(void);
 void ui_toggle(void);
+void ui_toggle_readout(void);
 
 void ui_new_frame(void);
 

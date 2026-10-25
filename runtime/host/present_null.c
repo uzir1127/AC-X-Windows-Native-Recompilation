@@ -13,6 +13,7 @@ int present_frame(u8 *ram, u32 addr, u32 stride, int fpf, int w, int h)
 }
 
 u32 present_buttons(void) { return 0u; }
+u32 present_flight_buttons(void) { return 0u; }
 
 void present_analog(u8 *lx, u8 *ly)
 {
@@ -33,6 +34,13 @@ void present_triggers(float *lt, float *rt)
 }
 
 u32 present_aux(void) { return 0u; }
+const char *present_controller_name(void) { return "None connected"; }
+void present_controller_select(unsigned id) { (void)id; }
+float present_rudder(void)
+{
+    return (present_aux() & PRESENT_AUX_LB ? 1.0f : 0.0f)
+         - (present_aux() & PRESENT_AUX_RB ? 1.0f : 0.0f);
+}
 
 void present_shutdown(void) { }
 

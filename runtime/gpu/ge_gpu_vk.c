@@ -6,6 +6,7 @@
 #include "tex_replace.h"
 #include "../host/present.h"
 #include "../host/settings.h"
+#include "../host/video_clarity.h"
 
 extern u8 *g_ram;
 #define SR_HOST(a) (g_ram + ((a) & PSP_ADDR_MASK))
@@ -1195,6 +1196,13 @@ static void tex_cache_flush(void) {
 }
 
 static float s_tex_half[2];
+static uint32_t s_video_scaled[1024*1024], s_video_tmp[1024*512];
+
+static int movie_texture(int *w, int *h) {
+    if (!g_gfx.movie_clarity || s_ge->tex_swizzle) return 0;
+    return mpeg_video_surface(s_ge->tex_addr, (int)s_ge->tex_fmt,
+                              s_ge->tex_bufw & 0x7ffu, w, h);
+}
 
 static int tex_fill(TexEnt *e, int pw, int ph, int linear, int clamp_u, int clamp_v) {
     TexRepImage rep;
@@ -1202,11 +1210,13 @@ static int tex_fill(TexEnt *e, int pw, int ph, int linear, int clamp_u, int clam
     TexLevel lv[TEXREP_MAX_LEVELS];
     int nlv = 1, have = 0, ident = 0, filt = linear;
     uint32_t levels;
+    int movie_w=0, movie_h=0;
+    int movie=movie_texture(&movie_w,&movie_h) && movie_w<=pw && movie_h<=ph;
 
     memset(&rep, 0, sizeof rep);
     memset(&id, 0, sizeof id);
 
-    if (texrep_replace_on() || texrep_dump_on()) ident = texrep_identify(&id);
+    if (!movie && (texrep_replace_on() || texrep_dump_on())) ident = texrep_identify(&id);
     if (ident) have = texrep_find(&id, &rep);
 
     if (have) {
@@ -1224,11 +1234,22 @@ static int tex_fill(TexEnt *e, int pw, int ph, int linear, int clamp_u, int clam
         lv[0].px = s_texscratch;
         lv[0].w = pw;
         lv[0].h = ph;
+        if (movie) {
+            video_upscale2x(s_texscratch,pw,movie_w,movie_h,s_video_scaled,pw*2,ph*2,s_video_tmp);
+            lv[0].px=s_video_scaled; lv[0].w=pw*2; lv[0].h=ph*2; filt=1;
+            static int logged;
+            if (!logged && getenv("PSPRECO_TEX_LOG")) {
+                logged=1;
+                fprintf(stderr,"[video] cinematic cubic upscale %dx%d -> %dx%d (texture %dx%d)\n",
+                        movie_w,movie_h,movie_w*2,movie_h*2,pw*2,ph*2);
+            }
+        }
     }
 
     if (!filt || !g_gfx.mipmaps_on) nlv = 1;
     levels = (uint32_t)nlv;
     if (nlv == 1 && filt && g_gfx.mipmaps_on) levels = mip_levels_for(lv[0].w, lv[0].h);
+    if (movie) levels=1;
 
     if (e->img && (e->w != lv[0].w || e->h != lv[0].h || e->levels != levels ||
                    e->linear != filt || e->clamp_u != clamp_u || e->clamp_v != clamp_v)) {
@@ -1260,6 +1281,8 @@ static VkDescriptorSet tex_get_inner(void) {
     if (tex_gen != g_gfx_generation) { tex_gen = g_gfx_generation; tex_cache_flush(); }
     if (w <= 0 || h <= 0 || w > 512 || h > 512) return s_white_set;
     int linear  = (s_ge->tex_filter & 1) || ((s_ge->tex_filter >> 8) & 1);
+    int movie_w, movie_h;
+    if (movie_texture(&movie_w,&movie_h)) linear=1;
     int clamp_u = s_ge->tex_wrap & 1, clamp_v = (s_ge->tex_wrap >> 8) & 1;
     if (g_gfx.tex_filter == TEXF_LINEAR) clamp_u = clamp_v = 1;
     uint64_t key = (uint64_t)s_ge->tex_addr | ((uint64_t)s_ge->tex_fmt << 32)
@@ -1890,6 +1913,29 @@ static int gegpu_present(uint32_t fbaddr, int fmt, uint32_t stride) {
         to_layout(s_cmd, t->img, VK_IMAGE_ASPECT_COLOR_BIT, &t->layout,
                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         if (!cmd_submit()) return -1;
+    }
+    /* Optional pixel-sequence regression trace. Disabled in ordinary play. */
+    {
+        static int trace_checked;
+        static FILE *trace;
+        static unsigned long long sequence;
+        if (!trace_checked) {
+            const char *path = getenv("PSPRECO_TEST_VIDEO_HASH");
+            trace_checked = 1;
+            if (path && *path) trace = fopen(path, "w");
+            if (trace) fprintf(trace, "sequence,movie_frame,buffer,pixel_hash\n");
+        }
+        if (trace && target_readback(t)) {
+            uint32_t hash = 2166136261u;
+            uint32_t bpp = t->fmt == 3 ? 4u : 2u;
+            const uint8_t *pixels = g_ram + 0x04000000u + t->fba;
+            for (uint32_t y = 0; y < FB_H; y++)
+                for (uint32_t x = 0; x < DRAW_W * bpp; x++)
+                    hash = (hash ^ pixels[y * t->stride * bpp + x]) * 16777619u;
+            fprintf(trace, "%llu,%u,%u,%08x\n", ++sequence,
+                    mem_r32(g_ram, 0x08b906a4u), t->fba, hash);
+            fflush(trace);
+        }
     }
     s_cnt_present_gpu++;
     stats_tick();

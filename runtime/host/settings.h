@@ -24,6 +24,7 @@ typedef struct {
     int   throttle;
     int   speed_percent;
     int   frameskip;
+    int   native_60fps;
     int   show_fps;
     int   show_stats;
 
@@ -33,6 +34,7 @@ typedef struct {
     int   anisotropy;
     int   rtt;
     int   tex_replace;
+    int   movie_clarity;
 
     int   fog;
     int   lighting;
@@ -54,7 +56,11 @@ typedef struct {
     int   rstick_cam;
     int   rstick_invert;
     int   rstick_sens;
-    int   analog_yaw;
+    int   modern_controls;
+    int   modern_keyboard;
+    int   mouse_flight;
+    int   mouse_sensitivity;
+    int   input_deadzone;
     int   r3_view;
 
     float brightness;

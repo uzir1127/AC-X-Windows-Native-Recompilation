@@ -1,5 +1,8 @@
 #include "ui_overlay.h"
 #include "settings.h"
+#include "hardware_stats.h"
+#include "present.h"
+#include "input_bindings.h"
 #include "../gpu/tex_replace.h"
 
 #include "imgui.h"
@@ -11,12 +14,18 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <float.h>
+#include <vector>
 
 #define MAX_IMAGES 8
 
 static bool            s_inited;
 static bool            s_backend_up;
 static bool            s_visible;
+static bool            s_readout_changed;
+static bool            s_advanced;
+static bool            s_saved;
+static uint64_t        s_saved_until;
 static SDL_Window     *s_win;
 static VkInstance      s_inst;
 static VkPhysicalDevice s_pdev;
@@ -113,6 +122,9 @@ int ui_init(const UiVkInfo *vk)
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.IniFilename = NULL;
+    ImFontConfig font;
+    font.SizePixels = 16.0f;
+    io.Fonts->AddFontDefault(&font);
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard
                     | ImGuiConfigFlags_NavEnableGamepad;
     ImGui::StyleColorsDark();
@@ -129,6 +141,26 @@ int ui_init(const UiVkInfo *vk)
     }
     s_inited = true;
     s_last_ticks = SDL_GetTicks();
+    VkPhysicalDeviceIDProperties id = {};
+    id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci = {};
+    pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+    uint32_t n_ext = 0;
+    bool have_pci = false;
+    if (vkEnumerateDeviceExtensionProperties(s_pdev, NULL, &n_ext, NULL) == VK_SUCCESS) {
+        std::vector<VkExtensionProperties> ext(n_ext);
+        if (vkEnumerateDeviceExtensionProperties(s_pdev, NULL, &n_ext, ext.data()) == VK_SUCCESS)
+            for (const auto &e : ext) if (!strcmp(e.extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME)) have_pci = true;
+    }
+    if (have_pci) id.pNext = &pci;
+    VkPhysicalDeviceProperties2 props = {};
+    props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props.pNext = &id;
+    vkGetPhysicalDeviceProperties2(s_pdev, &props);
+    char nvidia_bus[32] = {};
+    if (have_pci && props.properties.vendorID == 0x10de)
+        snprintf(nvidia_bus, sizeof nvidia_bus, "%08x:%02x:%02x.%x", pci.pciDomain, pci.pciBus, pci.pciDevice, pci.pciFunction);
+    hardware_stats_init(props.properties.deviceName, id.deviceLUID, id.deviceLUIDValid != 0, nvidia_bus);
     return 1;
 }
 
@@ -198,6 +230,9 @@ void ui_swapchain(uint32_t format, uint32_t width, uint32_t height,
 void ui_shutdown(void)
 {
     if (!s_inited) return;
+    if ((s_visible || s_readout_changed) && !gfx_settings_save())
+        fprintf(stderr, "[settings] could not save settings while closing the game\n");
+    hardware_stats_shutdown();
     vkDeviceWaitIdle(s_dev);
     destroy_targets();
     if (s_pass) { vkDestroyRenderPass(s_dev, s_pass, NULL); s_pass = VK_NULL_HANDLE; }
@@ -209,12 +244,22 @@ void ui_shutdown(void)
 
 int ui_visible(void) { return s_visible ? 1 : 0; }
 
+void ui_toggle_readout(void)
+{
+    g_gfx.show_fps = !g_gfx.show_fps;
+    s_readout_changed = true;
+    gfx_settings_touch();
+}
+
 void ui_toggle(void)
 {
     if (!s_inited) return;
     s_visible = !s_visible;
+    input_bindings_cancel_capture();
     SDL_SetWindowRelativeMouseMode(s_win, false);
-    if (!s_visible) gfx_settings_save();
+    if (!s_visible && (!gfx_settings_save() || !input_bindings_save()))
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Settings could not be saved",
+            "The game could not write pspreco.toml or controls.ini. Move the game to a writable folder and try again.", s_win);
 }
 
 int ui_handle_event(const void *sdl_event)
@@ -303,7 +348,11 @@ static void tab_output(void)
     if (ImGui::ColorEdit3("Letterbox bars", g_gfx.letterbox)) gfx_settings_touch();
 
     ImGui::SeparatorText("Frame pacing");
-    check("Throttle to 59.94 Hz", &g_gfx.throttle,
+    check("60 FPS gameplay (restart)", &g_gfx.native_60fps,
+          "Uses the physics-aware 60 FPS mode. Movies keep their original cadence. "
+          "Off selects original 30 FPS after restarting.");
+    if (s_advanced) {
+    check("Maintain normal game speed", &g_gfx.throttle,
           "Off runs as fast as the host can, which speeds the game up.");
     if (ImGui::SliderInt("Speed", &g_gfx.speed_percent, 25, 800, "%d%%"))
         gfx_settings_touch();
@@ -316,9 +365,12 @@ static void tab_output(void)
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Renders the GE list but skips presenting, so the "
                           "emulated clock keeps its pace on a slow host.");
-    check("Show FPS", &g_gfx.show_fps, NULL);
-    ImGui::SameLine();
-    check("Show GE counters", &g_gfx.show_stats, NULL);
+    }
+    check("Performance overlay (F5)", &g_gfx.show_fps,
+          "FPS, frame time, detected CPU/GPU names and total utilization. "
+          "GPU usage is for the device rendering this game. Updates once a second; "
+          "unavailable counters show N/A.");
+    if (s_advanced) { ImGui::SameLine(); check("Show GE counters", &g_gfx.show_stats, NULL); }
 }
 
 static void tab_render(void)
@@ -330,6 +382,9 @@ static void tab_render(void)
         ImGui::SetTooltip("Supersamples the GE render targets: %dx%d instead of "
                           "480x272. Costs GPU fill rate, nothing else.",
                           480 * g_gfx.res_scale, 272 * g_gfx.res_scale);
+    check("Cinematic clarity", &g_gfx.movie_clarity,
+          "Smooth 2x cubic upscale for prerecorded movies from your ISO. "
+          "Keeps the original movie cadence; live game text uses the HD font pack.");
     combo_int("Texture filter", &g_gfx.tex_filter, k_texf, 3);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
@@ -426,10 +481,21 @@ static void tab_colour(void)
 
 static void tab_input(void)
 {
-    ImGui::TextDisabled("Controls the PSP did not have. The engine already\n"
-                        "contained the code for all three -- there was simply\n"
-                        "no second stick, no trigger travel and no stick click\n"
-                        "for it to read.");
+    if (ImGui::BeginCombo("Input device", present_controller_name())) {
+        int n = 0;
+        SDL_JoystickID *ids = SDL_GetJoysticks(&n);
+        for (int i = 0; ids && i < n; ++i) {
+            ImGui::PushID((int)ids[i]);
+            if (ImGui::Selectable(SDL_GetJoystickNameForID(ids[i]))) present_controller_select(ids[i]);
+            ImGui::PopID();
+        }
+        SDL_free(ids);
+        ImGui::EndCombo();
+    }
+    ImGui::TextWrapped("Controller: %s", present_controller_name());
+    ImGui::TextDisabled("Xbox / PlayStation / Switch / mapped USB pads\n"
+                        "Left stick flies; right stick looks.\n"
+                        "Menu/Options/+ pauses; View/Create/- changes radar.");
     ImGui::Spacing();
     check("Right stick moves the camera", &g_gfx.rstick_cam,
           "Uses the engine's own look limits: 170 degrees in the chase views, "
@@ -444,15 +510,84 @@ static void tab_input(void)
         ImGui::Unindent();
     }
     ImGui::Spacing();
-    check("Analog rudder on the triggers", &g_gfx.analog_yaw,
-          "The aircraft yaws by as much as the trigger is pressed, instead of "
-          "ramping to full over twenty frames. The shoulder buttons still "
-          "work exactly as they did.");
+    check("Modern shoulder controls", &g_gfx.modern_controls,
+          "LB/RB, L1/R1 or L/R yaw. LT/RT, L2/R2 or ZL/ZR brake/accelerate. "
+          "Keyboard Q/E also yaw with this enabled. Weapons stay unchanged. "
+          "Menus retain PSP shoulder navigation. Disable for the original "
+          "PSP shoulder mapping.");
     check("R3 changes view", &g_gfx.r3_view,
           "Cycles the same three views, in the same order, as the game's own "
           "view button.");
+    if (ImGui::SliderInt("Controller dead zone", &g_gfx.input_deadzone, 0, 50, "%d%%")) gfx_settings_touch();
     ImGui::Spacing();
-    ImGui::TextDisabled("Keyboard: IJKL looks around, C changes view.");
+    ImGui::SeparatorText("Keyboard");
+    check("Modern keyboard (Zero-style)", &g_gfx.modern_keyboard,
+          "Separate flight/menu keys. Escape pauses instead of quitting. "
+          "Disable to restore the previous X/Z/A/S keyboard layout.");
+    if (g_gfx.modern_keyboard) {
+        ImGui::TextWrapped("Flight: W/S pitch down/up; A/D roll; Q/E yaw.\n"
+                          "Ctrl brake; Space accelerate.\n"
+                          "J gun; L missile/special; K weapon; T target.\n"
+                          "V view; M or Tab radar; Esc pause; F1 Start/skip.\n"
+                          "Camera: numpad 4/6/8/2 or hold Alt + WASD.\n"
+                          "Menus: WASD/arrows navigate; Enter/Space confirm;\n"
+                          "Backspace/Esc back; Q/E tabs. Alt+F4 exits.");
+    } else {
+        ImGui::TextWrapped("Legacy: X gun, Z missile, A weapon, S target;\n"
+                          "Q/W brake/accelerate; arrows D-pad; IJKL camera;\n"
+                          "C view; Enter Start; Shift radar; Esc exits.");
+    }
+    ImGui::SeparatorText("Mouse");
+    check("Mouse flight control", &g_gfx.mouse_flight,
+          "Move the mouse to pitch/roll. Hold Alt for camera look. "
+          "The pointer is captured only during flight; F4 releases it.");
+    if (ImGui::SliderInt("Mouse sensitivity", &g_gfx.mouse_sensitivity, 10, 400, "%d%%")) gfx_settings_touch();
+    ImGui::TextWrapped("Left click: gun; right click: missile; middle click: target; "
+                      "wheel: weapon. Mouse buttons use the modern keyboard preset.");
+    if (ImGui::CollapsingHeader("Rebind flight controls")) {
+        ImGui::TextWrapped("Choose a binding, then press a key/button, move an axis or hat. "
+                          "Escape cancels. Keyboard/menu navigation stays available. "
+                          "For an unmapped joystick/HOTAS, select the device above and bind its actions here. "
+                          "Controller profiles follow the device GUID; keyboard/mouse are shared.");
+        ImGui::TextWrapped("Connected devices combine: separate USB stick, throttle and pedals can work together. "
+                          "Pitch/roll/rudder axes are proportional. Throttle axes drive ACX's original brake/accelerate actions. "
+                          "Use Full range for a throttle lever; positive/negative halves for a centered axis.");
+        if (input_bindings_capturing()) ImGui::TextColored(ImVec4(1,.8f,.2f,1), "Waiting for input... Esc cancels");
+        static int src = IB_KEYBOARD;
+        const char *sources[] = {"Keyboard", "Mouse buttons", "Controller / joystick"};
+        ImGui::Combo("Rebind device", &src, sources, 3);
+        if (ImGui::BeginTable("bindings", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Action"); ImGui::TableSetupColumn("Binding");
+            ImGui::TableHeadersRow();
+            for (int a = 0; a < IA_COUNT; ++a) {
+                ImGui::PushID(a); ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(input_action_name(a));
+                {
+                    char label[80]; ImGui::PushID(src); ImGui::TableSetColumnIndex(1);
+                    input_binding_label(src, a, label, sizeof label);
+                    if (ImGui::Button(label)) input_bindings_capture(src, a);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("x")) input_binding_set(src, a, {IB_NONE,0,0});
+                    InputBinding b = input_binding_get(src, a);
+                    if (src == IB_CONTROLLER && b.kind == IB_AXIS) {
+                        const char *modes[] = {"Positive half", "Negative half", "Full range", "Full reversed"};
+                        int mode = b.direction == 1 ? 0 : b.direction == -1 ? 1 : b.direction == 2 ? 2 : 3;
+                        ImGui::SetNextItemWidth(115);
+                        if (ImGui::Combo("##axis", &mode, modes, 4)) {
+                            const int dirs[] = {1,-1,2,-2}; b.direction = dirs[mode]; input_binding_set(src, a, b);
+                        }
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (ImGui::Button("Reset keyboard")) input_bindings_reset(IB_KEYBOARD);
+        ImGui::SameLine(); if (ImGui::Button("Reset mouse")) input_bindings_reset(IB_MOUSE_DEVICE);
+        ImGui::SameLine(); if (ImGui::Button("Reset controller")) input_bindings_reset(IB_CONTROLLER);
+        ImGui::TextWrapped("Bindings save to controls.ini when F4 closes. Copy that file with pspreco.toml to retain your layout.");
+    }
 }
 
 static void tab_debug(void)
@@ -475,9 +610,9 @@ static void tab_debug(void)
 
 static void draw_menu(void)
 {
-    ImGui::SetNextWindowSize(ImVec2(560, 460), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Graphics  (F4 closes)", NULL, ImGuiWindowFlags_NoCollapse)) {
+    ImGui::SetNextWindowSize(ImVec2(660, 480), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(30, 24), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Settings  (F4 closes)", NULL, ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
     }
@@ -495,21 +630,29 @@ static void draw_menu(void)
     ImGui::SameLine();
     ImGui::TextDisabled("%s", cur < 0 ? "(custom)" : "");
 
+    ImGui::Checkbox("Advanced settings", &s_advanced);
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Output"))  { tab_output(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Renderer")){ tab_render(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("GE"))      { tab_ge();     ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Engine"))  { tab_engine(); ImGui::EndTabItem(); }
+        if (s_advanced && ImGui::BeginTabItem("GE"))      { tab_ge();     ImGui::EndTabItem(); }
+        if (s_advanced && ImGui::BeginTabItem("Engine"))  { tab_engine(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Colour"))  { tab_colour(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Input"))   { tab_input();  ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Debug"))   { tab_debug();  ImGui::EndTabItem(); }
+        if (s_advanced && ImGui::BeginTabItem("Debug"))   { tab_debug();  ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
 
     ImGui::Separator();
-    if (ImGui::Button("Save now"))   gfx_settings_save();
+    if (ImGui::Button("Save now")) {
+        s_saved = gfx_settings_save() && input_bindings_save();
+        s_saved_until = SDL_GetTicks() + 3000;
+    }
+    if (s_saved_until > SDL_GetTicks()) {
+        ImGui::SameLine();
+        ImGui::TextUnformatted(s_saved ? "Saved" : "Could not save settings");
+    }
     ImGui::SameLine();
-    if (ImGui::Button("Reload"))     gfx_settings_load();
+    if (ImGui::Button("Reload")) { gfx_settings_load(); input_bindings_reload(); }
     ImGui::SameLine();
     if (ImGui::Button("Defaults"))   gfx_settings_defaults();
     ImGui::SameLine();
@@ -519,16 +662,27 @@ static void draw_menu(void)
 
 static void draw_readout(void)
 {
-    if (!g_gfx.show_fps && !g_gfx.show_stats) return;
+    if (!g_gfx.show_fps) return;
     ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_Always);
+    float width = ImGui::GetIO().DisplaySize.x - 32.0f;
+    if (width < 160.0f) width = 160.0f;
+    if (width > 720.0f) width = 720.0f;
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(width + 16, FLT_MAX));
     ImGui::SetNextWindowBgAlpha(0.35f);
     if (ImGui::Begin("readout", NULL,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs
                      | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav
                      | ImGuiWindowFlags_NoSavedSettings)) {
-        if (g_gfx.show_fps)
-            ImGui::Text("%.1f fps game   %.1f present   %.2f ms",
-                        s_game_fps, s_fps, s_frame_ms);
+        ImGui::Text("Game %.1f FPS | Display %.1f FPS | %.2f ms",
+                    s_game_fps, s_fps, s_frame_ms);
+        HardwareStats hw = hardware_stats_read();
+        char cpu[24] = "N/A", gpu[24] = "N/A";
+        if (hw.cpu_valid) snprintf(cpu, sizeof cpu, "%.0f%%", hw.cpu_percent);
+        if (hw.gpu_valid) snprintf(gpu, sizeof gpu, "%.0f%%", hw.gpu_percent);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width);
+        ImGui::TextWrapped("%s  %s", hw.cpu_name, cpu);
+        ImGui::TextWrapped("%s  %s", hw.gpu_name, gpu);
+        ImGui::PopTextWrapPos();
         if (g_gfx.show_stats) {
             ImGui::Text("%dx%d  x%d", 480 * g_gfx.res_scale, 272 * g_gfx.res_scale,
                         g_gfx.res_scale);
@@ -541,6 +695,7 @@ static void draw_readout(void)
 void ui_new_frame(void)
 {
     if (!s_inited || !s_backend_up) return;
+    hardware_stats_set_visible(g_gfx.show_fps != 0);
 
     uint64_t now = SDL_GetTicks();
     s_frames++;
@@ -556,6 +711,8 @@ void ui_new_frame(void)
     }
 
     ImGui_ImplVulkan_NewFrame();
+    if (input_bindings_block_navigation()) ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+    else ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
     if (s_visible) draw_menu();

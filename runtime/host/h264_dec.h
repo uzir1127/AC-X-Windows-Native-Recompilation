@@ -16,6 +16,7 @@ void h264_feed(H264Dec *d, const uint8_t *data, uint32_t len);
 
 int h264_frame(H264Dec *d, int eos, uint8_t *dst, int frameWidth,
                int pixelMode);
+int h264_frame_dimensions(H264Dec *d, int *width, int *height);
 
 #ifdef __cplusplus
 }

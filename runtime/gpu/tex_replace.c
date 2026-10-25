@@ -1388,10 +1388,10 @@ int texrep_find(TexRepId *id, TexRepImage *img)
     }
     if (s_log && !a->logged) {
         a->logged = 1;
-        fprintf(stderr, "[tex] %3dx%-3d -> %4dx%-4d %.2fx %d level(s)  %s\n",
+        fprintf(stderr, "[tex] %3dx%-3d -> %4dx%-4d %.2fx %d level(s) %016llx%08x  %s\n",
                 id->psp_w, id->psp_h, img->w[0], img->h[0],
                 (double)img->w[0] / (double)(id->psp_w ? id->psp_w : 1),
-                img->levels, a->file[0]);
+                img->levels, (unsigned long long)id->cachekey, used_hash, a->file[0]);
     }
 
     id->hash = used_hash;

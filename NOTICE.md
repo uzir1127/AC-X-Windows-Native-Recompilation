@@ -26,9 +26,9 @@ from PPSSPP, `runtime/gpu/` is GPLv2-or-later.
 extracted from FFmpeg by the PPSSPP project to be standalone. See that
 directory's own `README.txt`.
 
-`third_party/ppsspp/assets/flash0/font/` contains the PSP system fonts that
-PPSSPP bundles as test assets. They are used here so on-screen text has
-something to render with.
+`third_party/ppsspp/assets/flash0/font/` contains replacement PGF fonts
+distributed by PPSSPP. They are used here for on-screen text.
+See https://dev.ppsspp.org/docs/getting-started/using-original-fonts/.
 
 The texture replacement system in `runtime/gpu/tex_replace.c` reproduces
 PPSSPP's `GPU/Common/TextureReplacer.cpp` behaviour so that texture packs built
@@ -95,3 +95,47 @@ No part of "Ace Combat X: Skies of Deception" ships with this repository — no
 disc image, no extracted files, no asset archive, no executable, and no save
 data. This project is a compiler pipeline plus an OS-reimplementation runtime.
 You supply the game's data yourself, from media you own.
+
+## Local Windows build - 2026-10-25
+
+Base project: https://github.com/sal063/Ace-Combat-X-Recompilation
+
+Local changes include physics-aware 60 FPS timing and cinematic cadence,
+modern Xbox controls, direct read-only ISO startup, F4 settings persistence,
+and portable Windows packaging. The engine-uncapping prototype is excluded.
+The matching generated C, runtime and build sources are in licenses/source.zip.
+
+This package includes OstrichMods' ACX HD Texture Pack v2.0.8 unchanged.
+Author: https://ostrichmods.com/acx.html
+Complete pack credits are in textures/ULUS10176/CREDITS.txt.
+The original pack ZIP fingerprint is recorded there for provenance.
+See VALIDATION.txt for the measured testing scope; full campaign completion
+is not implied by the timing and mission-entry regression checks.
+
+The modern input update adds Zero-style keyboard/mouse defaults and F4
+bindings for SDL gamepads and arbitrary SDL joystick axes/buttons/hats.
+The action-layout reference is the Zero PC dinputSample.ini published by
+Foxvic/ACZeroPCremap; no code from that remapper is included.
+The Windows controller mapping subset comes from mdqinc/SDL_GameControllerDB.
+Its upstream blob identifier is in gamecontrollerdb.txt, and its zlib license
+is included at licenses/SDL_GameControllerDB/LICENSE.txt.
+
+## Enhancement fork credits and linked runtimes - 2026-10-26
+
+See CREDITS.md in the source repository and CREDITS.txt in the Windows
+download for the original-project, artwork and technical-reference credits.
+The baseline F4 menu and input/camera support are part of sal063's project.
+Nukem9's documented ACX patch locations were used as a cross-check; the
+native implementation is described in README.txt. The included texture
+artwork is by OstrichMods and the artists identified in the pack's credits.
+
+SDL3 and the SDL_GameControllerDB subset retain their zlib notices.
+Linked compiler/runtime notices are supplied in licenses/LLVM and
+licenses/MinGW-w64 in the Windows download (and packaging/licenses in
+the source). Those notices cover LLVM runtime components, MinGW-w64
+runtime code and winpthreads; they do not mean the compiler is needed to play.
+
+For this fork's Windows release, the upstream game-content exclusion above
+refers to original disc data: the native runtime executable and credited
+third-party replacement textures ARE included. No ISO, original extracted
+game files, original movie/audio archives, or personal saves are included.

@@ -1,4 +1,5 @@
 #include "hle.h"
+#include "framerate.h"
 #include "modloader.h"
 #include "script.h"
 #include "acx_api.h"
@@ -242,7 +243,17 @@ u32 display_frame_us(void) { return PSP_FRAME_US; }
 
 void hle_sceDisplayWaitVblankStart(CpuCtx *c, u8 *ram)
 {
-    (void)ram;
+    /* ACX_Frame_Render has already slept until the frame-gate interrupt
+     * before calling the main flip (a1 == 1). Its original flip then asks
+     * IsVblank, which this runtime cannot time accurately and reports false.
+     * Reuse that completed wait only at this verified game call site. Other
+     * flip paths (movies/loading/UI, a1 == 0) still wait normally, and guest
+     * display/audio/kernel time remains 59.94 Hz. */
+    if (framerate_is_60() && c->r[R_RA] == 0x089e1708u
+        && mem_r32(ram, c->r[R_FP] + 4u) == 1u) {
+        HLE_RET(0);
+        return;
+    }
     HLE_RET(0);
     threadman_wait_vblank();
 }

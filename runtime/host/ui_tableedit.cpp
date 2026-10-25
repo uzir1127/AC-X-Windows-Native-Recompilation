@@ -243,7 +243,7 @@ void plane_ui_draw(void)
 
     ImGui::SetNextWindowSize(ImVec2(700, 580), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(600, 40), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Parameter tables  (F5 closes)", NULL,
+    if (!ImGui::Begin("Parameter tables  (F6 closes)", NULL,
                       ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
