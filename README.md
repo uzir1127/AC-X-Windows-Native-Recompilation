@@ -1,4 +1,4 @@
-# Ace Combat X - Recompilation
+# Ace Combat X: Skies of Deception - Recompilation
 
 An unofficial enhancement project maintained by [**uzir1127**](https://github.com/uzir1127), based on [sal063/Ace-Combat-X-Recompilation](https://github.com/sal063/Ace-Combat-X-Recompilation). This is a standalone repository that preserves the original project's history, license and credits.
 
