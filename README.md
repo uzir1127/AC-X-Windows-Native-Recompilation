@@ -1,18 +1,18 @@
 # Ace Combat X - Recompilation
 
-An unofficial Windows enhancement project maintained by [**uzir1127**](https://github.com/uzir1127), based on [sal063/Ace-Combat-X-Recompilation](https://github.com/sal063/Ace-Combat-X-Recompilation). This is a standalone repository that preserves the original project's history, license and credits.
+An unofficial enhancement project maintained by [**uzir1127**](https://github.com/uzir1127), based on [sal063/Ace-Combat-X-Recompilation](https://github.com/sal063/Ace-Combat-X-Recompilation). This is a standalone repository that preserves the original project's history, license and credits.
 
-**Huge thanks to [sal063](https://github.com/sal063) for the amazing work on the original Ace Combat X recompilation.** Their recompiler, native runtime and renderer made this version possible. Please check out and support [the original project](https://github.com/sal063/Ace-Combat-X-Recompilation).
+**Huge thanks to [sal063](https://github.com/sal063) for the amazing work on the original Ace Combat X recompilation.** Their recompiler, native runtime and renderer made this version possible. Please check out and support [the original project](https://github.com/sal063/Ace-Combat-X-Recompilation). Also check out his other recompilations for other Ace Combat games, really amazing work.
 
 ## Download and play
 
 Get the **Windows ZIP asset** from [Releases](https://github.com/uzir1127/Ace-Combat-X-Recompilation/releases). The green Code button and GitHub's automatic “Source code” downloads are for development, not the ready-to-play package.
 
 1. Extract the entire Windows ZIP.
-2. Put your own **US Ace Combat X ISO (ULUS10176)** beside `Play.bat`.
+2. Put your own **US Ace Combat X ISO (ULUS10176)** inside the main "Ace Combat X - Recompilation" folder.
 3. Double-click **Play.bat**.
 
-The ISO can have any filename. Keep one ISO beside the launcher, or drag the chosen ISO onto `Play.bat`. **No Python, LLVM, compiler, installer or separate image.bin is needed to play.** Use 64-bit Windows with a working Vulkan driver and Media Foundation. The ISO is read-only and is not included.
+The ISO can have any filename. Keep one ISO inside the folder. **No Python, LLVM, compiler, installer or separate image.bin is needed to play.** Use 64-bit Windows with a working Vulkan driver and Media Foundation. The ISO is read-only and is not included.
 
 ## What this version adds
 
