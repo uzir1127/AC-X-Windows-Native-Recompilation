@@ -340,6 +340,10 @@ static void clut_table_build(void) {
 
 unsigned long g_tex_samples = 0, g_tex_nonzero = 0;
 static uint32_t s_ge_frame = 0;
+static uint32_t s_rain_frame;
+static int s_rain_seen;
+void ge_weather_rain_seen(void) { s_rain_seen=1;s_rain_frame=s_ge_frame; }
+int ge_weather_rain_active(void) { return s_rain_seen && s_ge_frame-s_rain_frame<=2u; }
 
 static struct {
     unsigned long tri2d, tri3d, spr2d, spr3d, cull, nearclip, zfail, afail, px2d, px3d, zrange;

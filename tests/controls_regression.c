@@ -42,6 +42,46 @@ static float simulate(int injected,u32 buttons,float direction,int other,int *ba
  }
  return angle;
 }
+static int animation_check(void){
+ int bad=0;float expect_axis[12],expect_surface[12];
+ RecompFn left=qol_override(0x0887d8e8,func_0887d8e8),right=qol_override(0x0887da18,func_0887da18);
+ for(int mode=0;mode<5;mode++)for(int direction=-1;direction<=1;direction+=2){
+  float strength=mode<3?(mode+1)*.25f:1.0f;
+  for(int modern=0;modern<2;modern++){
+   memcpy(g_ram+0x08000000,snapshot,0x02000000);
+   mem_w32(g_ram,0x08a82ed8,mode==4?player+0x2000:player);
+   mem_wf32(g_ram,aircraft+0xc8,0);mem_wf32(g_ram,aircraft+0xb4,.37f);
+   g_qol.modern_controls=mode!=3;rudder_strength=strength;
+   aux=modern?(direction>0?PRESENT_AUX_LB:PRESENT_AUX_RB):0;
+   for(int frame=0;frame<12;frame++){
+    mem_wf32(g_ram,aircraft+0x100,0);
+    for(int side=1;side>=-1;side-=2){
+     CpuCtx c=seed;c.r[R_A0]=player;c.r[R_A1]=aircraft;
+     c.r[R_A2]=!modern&&mode<3&&side==direction;c.f[12]=modern?0:strength;
+     if(modern)(side>0?left:right)(&c,g_ram);
+     else(side>0?func_0887d8e8:func_0887da18)(&c,g_ram);
+     if(modern&&(c.r[R_A2]!=0||c.f[12]!=0))bad++;
+    }
+    float axis=mem_rf32(g_ram,aircraft+0x100),surface=mem_rf32(g_ram,aircraft+0xc8);
+    if(!modern){expect_axis[frame]=axis;expect_surface[frame]=surface;}
+    else if(axis!=expect_axis[frame]||surface!=expect_surface[frame]||mem_rf32(g_ram,aircraft+0xb4)!=.37f)bad++;
+   }
+  }
+  if(mode<3){
+   printf("Rudder animation dir=%d strength=%.2f axis=%.6f surface=%.6f\n",direction,strength,expect_axis[11],expect_surface[11]);
+   if(expect_axis[11]*direction<=0||expect_surface[11]*direction<=0)bad++;
+  }
+ }
+ /* Opposed bumpers and released controls do not fabricate rudder input. */
+ memcpy(g_ram+0x08000000,snapshot,0x02000000);mem_w32(g_ram,0x08a82ed8,player);g_qol.modern_controls=1;rudder_strength=1;
+ for(int mask=0;mask<2;mask++){
+  aux=mask?(PRESENT_AUX_LB|PRESENT_AUX_RB):0;mem_wf32(g_ram,aircraft+0x100,0);mem_wf32(g_ram,aircraft+0xc8,0);
+  CpuCtx c=seed;c.r[R_A0]=player;c.r[R_A1]=aircraft;c.r[R_A2]=0;c.f[12]=0;left(&c,g_ram);right(&c,g_ram);
+  if(mem_rf32(g_ram,aircraft+0x100)!=0||mem_rf32(g_ram,aircraft+0xc8)!=0)bad++;
+ }
+ aux=0;puts("Native D-pad versus modern rudder animation/axis: both directions, analog strength, release/opposition, toggle and NPC bypass checked.");
+ return bad;
+}
 int main(int argc,char**argv){
  if(argc!=3)return 2;
  FILE*f=fopen(argv[1],"rb");if(!f||fread(&seed,1,sizeof seed,f)!=sizeof seed)return 3;fclose(f);
@@ -86,5 +126,5 @@ int main(int argc,char**argv){
   g_qol.modern_controls=1;got=simulate(1,0,0,0,&bad);if(ref!=got)bad++;
  }
  puts("Verified original yaw physics, 30/60 FPS, opposed/released bumpers, NPC bypass, toggle-off, and input/throttle restoration.");
- printf("controls failures: %d\n",bad);return bad?1:0;
+ bad+=animation_check();printf("controls failures: %d\n",bad);return bad?1:0;
 }

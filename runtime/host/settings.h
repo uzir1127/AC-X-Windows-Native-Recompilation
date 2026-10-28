@@ -35,6 +35,7 @@ typedef struct {
     int   rtt;
     int   tex_replace;
     int   movie_clarity;
+    int   rain_clarity;
 
     int   fog;
     int   lighting;
@@ -61,6 +62,8 @@ typedef struct {
     int   mouse_flight;
     int   mouse_sensitivity;
     int   input_deadzone;
+    int   rumble;
+    int   rumble_strength;
     int   r3_view;
 
     float brightness;

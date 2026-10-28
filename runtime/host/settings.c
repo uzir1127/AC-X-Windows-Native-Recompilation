@@ -54,6 +54,7 @@ static const Field k_fields[] = {
     F("render", "rtt",             T_BOOL,  rtt,              0, 1),
     F("render", "tex_replace",     T_BOOL,  tex_replace,      0, 1),
     F("render", "movie_clarity",   T_BOOL,  movie_clarity,    0, 1),
+    F("render", "rain_clarity",    T_BOOL,  rain_clarity,     0, 1),
 
     F("ge",     "fog",             T_INT,   fog,              0, 2),
     F("ge",     "lighting",        T_INT,   lighting,         0, 2),
@@ -81,6 +82,8 @@ static const Field k_fields[] = {
     F("input",  "mouse_flight", T_BOOL, mouse_flight, 0, 1),
     F("input",  "mouse_sensitivity", T_INT, mouse_sensitivity, 10, 400),
     F("input",  "deadzone", T_INT, input_deadzone, 0, 50),
+    F("input",  "rumble", T_BOOL, rumble, 0, 1),
+    F("input",  "rumble_strength", T_INT, rumble_strength, 0, 100),
     F("input",  "r3_view",         T_BOOL,  r3_view,          0, 1),
 
     F("colour", "brightness",      T_FLOAT, brightness,    -0.5f, 0.5f),
@@ -137,10 +140,13 @@ void gfx_settings_defaults(void)
     g_gfx.rtt            = 1;
     g_gfx.tex_replace    = 1;
     g_gfx.movie_clarity  = 1;
+    g_gfx.rain_clarity   = 1;
     g_gfx.modern_keyboard = 1;
     g_gfx.mouse_flight = 1;
     g_gfx.mouse_sensitivity = 100;
     g_gfx.input_deadzone = 24;
+    g_gfx.rumble = 1;
+    g_gfx.rumble_strength = 70;
     g_gfx.fog_distance   = 1.0f;
     g_gfx.fog_start      = 1.0f;
     g_gfx.contrast       = 1.0f;

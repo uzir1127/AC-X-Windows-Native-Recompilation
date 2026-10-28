@@ -23,7 +23,21 @@ static int extended(SDL_JoystickID original) {
  int bad=0;u8 x,y,rx,ry;float tl,tr;
 #define CHECK(expr) do{if(!(expr)){printf("FAIL line %d: %s\n",__LINE__,#expr);bad++;}}while(0)
 #define CLEAR() do{memset(keys,0,sizeof keys);input_bindings_test_mouse(0);present_test_mouse(0,0,1.0f/60);sample(original);}while(0)
- mem_w32(g_ram,0x08a82ed8,0x08880000);mem_w8(g_ram,0x08a82e08,12);mem_w8(g_ram,0x08a80c45,1);
+ mem_w32(g_ram,0x08a82ed8,0x08880000);mem_w8(g_ram,0x08a82e08,12);mem_w32(g_ram,0x08b7f1b0,0);
+ /* Captured native sequence: initial (result=0,pause=0), paused
+  * (0,1), resumed (1,0). Missile/yaw must work before the first pause. */
+ SDL_Joystick*contextpad=SDL_GetJoystickFromID(original);
+ for(int context=0;context<3;context++){
+  mem_w8(g_ram,0x08a80c45,context==2);mem_w32(g_ram,0x08b7f1b0,context==1);
+  CLEAR();SDL_SetJoystickVirtualButton(contextpad,SDL_GAMEPAD_BUTTON_EAST,true);
+  SDL_SetJoystickVirtualButton(contextpad,SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,true);sample(original);
+  CHECK(present_flight_buttons()==(context==1?0x1100:0x2000));
+  CHECK(present_rudder()==(context==1?0:1));
+  CHECK(!!(present_aux()&PRESENT_AUX_LB)==(context!=1));
+  SDL_SetJoystickVirtualButton(contextpad,SDL_GAMEPAD_BUTTON_EAST,false);
+  SDL_SetJoystickVirtualButton(contextpad,SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,false);CLEAR();
+ }
+ mem_w8(g_ram,0x08a80c45,0);mem_w32(g_ram,0x08b7f1b0,0);
  CLEAR();
  keys[SDL_SCANCODE_A]=true;keys[SDL_SCANCODE_W]=true;sample(original);present_analog(&x,&y);CHECK(x==0&&y==0);CHECK(present_flight_buttons()==0);
  keys[SDL_SCANCODE_D]=true;keys[SDL_SCANCODE_S]=true;sample(original);present_analog(&x,&y);CHECK(x==128&&y==128);
@@ -37,7 +51,7 @@ static int extended(SDL_JoystickID original) {
  keys[SDL_SCANCODE_V]=true;sample(original);CHECK(present_aux()==PRESENT_AUX_R3);CLEAR();
  keys[SDL_SCANCODE_LALT]=keys[SDL_SCANCODE_W]=keys[SDL_SCANCODE_D]=true;sample(original);present_analog(&x,&y);present_analog2(&rx,&ry);
  CHECK(x==128&&y==128&&rx==255&&ry==0);CLEAR();
- keys[SDL_SCANCODE_SPACE]=true;sample(original);mem_w8(g_ram,0x08a80c45,0);sample(original);CHECK(!(present_flight_buttons()&0x4000));CLEAR();
+ keys[SDL_SCANCODE_SPACE]=true;sample(original);mem_w32(g_ram,0x08b7f1b0,1);sample(original);CHECK(!(present_flight_buttons()&0x4000));CLEAR();
  keys[SDL_SCANCODE_SPACE]=true;sample(original);CHECK(present_flight_buttons()==0x4000);CLEAR();
  keys[SDL_SCANCODE_W]=true;keys[SDL_SCANCODE_RETURN]=true;sample(original);present_analog(&x,&y);
  CHECK(x==128&&y==128&&present_flight_buttons()==(0x10|0x4000));CLEAR();
@@ -47,7 +61,7 @@ static int extended(SDL_JoystickID original) {
  SDL_SetJoystickVirtualButton(pausepad,SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,true);sample(original);CHECK(present_flight_buttons()==0x100&&present_rudder()==0&&!(present_aux()&PRESENT_AUX_LB));SDL_SetJoystickVirtualButton(pausepad,SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,false);
  mem_w8(g_ram,0x08a82e08,10);keys[SDL_SCANCODE_ESCAPE]=true;sample(original);CHECK(present_buttons()==0x1000);CLEAR();
  keys[SDL_SCANCODE_RETURN]=true;sample(original);CHECK(present_buttons()==0x4000);CLEAR();
- mem_w8(g_ram,0x08a82e08,12);mem_w8(g_ram,0x08a80c45,1);
+ mem_w8(g_ram,0x08a82e08,12);mem_w32(g_ram,0x08b7f1b0,0);
  mem_w8(g_ram,0x08a82e08,22);keys[SDL_SCANCODE_S]=true;sample(original);present_analog(&x,&y);CHECK(y==255);CLEAR();mem_w8(g_ram,0x08a82e08,12);
  input_binding_set(IB_KEYBOARD,IA_ROLL_L,(InputBinding){IB_KEY,SDL_SCANCODE_F,1});
  keys[SDL_SCANCODE_A]=true;sample(original);present_analog(&x,&y);CHECK(x==128);keys[SDL_SCANCODE_F]=true;sample(original);present_analog(&x,&y);CHECK(x==0);CLEAR();
@@ -129,7 +143,7 @@ int main(void){
  SDL_JoystickID id=SDL_AttachVirtualJoystick(&d);if(!id){puts(SDL_GetError());return 3;}
  SDL_Joystick*j=SDL_OpenJoystick(id);if(!j)return 4;
  gfx_settings_defaults();g_ram=calloc(1,PSP_RAM_SIZE);mem_w32(g_ram,0x0887211c,0x27bdffd0);qol_input_install(g_ram);
- mem_w32(g_ram,0x08a82ed8,0x08880000);mem_w8(g_ram,0x08a82e08,12);mem_w8(g_ram,0x08a80c45,1);
+ mem_w32(g_ram,0x08a82ed8,0x08880000);mem_w8(g_ram,0x08a82e08,12);mem_w32(g_ram,0x08b7f1b0,0);
  input_bindings_reload();input_bindings_reset(IB_KEYBOARD);input_bindings_reset(IB_MOUSE_DEVICE);
  for(int m=0;m<16;m++){
   SDL_SetJoystickVirtualButton(j,SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,(m&1)!=0);

@@ -27,6 +27,8 @@ void present_triggers(float *lt, float *rt);
 u32  present_aux(void);
 const char *present_controller_name(void);
 void present_controller_select(unsigned id);
+int present_rumble_supported(void);
+void present_rumble_test(void);
 float present_rudder(void);
 
 void present_shutdown(void);

@@ -36,6 +36,8 @@ void present_triggers(float *lt, float *rt)
 u32 present_aux(void) { return 0u; }
 const char *present_controller_name(void) { return "None connected"; }
 void present_controller_select(unsigned id) { (void)id; }
+int present_rumble_supported(void) { return 0; }
+void present_rumble_test(void) { }
 float present_rudder(void)
 {
     return (present_aux() & PRESENT_AUX_LB ? 1.0f : 0.0f)

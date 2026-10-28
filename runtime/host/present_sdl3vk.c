@@ -1,5 +1,8 @@
 #include "present.h"
 #include "../hle/qol_input.h"
+#include "../hle/rumble.h"
+#include "../hle/game_state.h"
+#include "rumble_envelope.h"
 #include "settings.h"
 #include "input_bindings.h"
 #include "video_clarity.h"
@@ -28,6 +31,87 @@ typedef struct { SDL_JoystickID id; SDL_Gamepad *pad; SDL_Joystick *joy; } Input
 static InputDevice s_inputs[32];
 static int s_input_count;
 extern u8 *g_ram;
+
+static RumbleEnvelope s_rumble;
+static Uint64 s_rumble_next, s_rumble_preview;
+static int s_rumble_running, s_rumble_failed;
+static int s_rumble_ready;
+static Uint64 s_rumble_retry;
+static SDL_Joystick *rumble_joystick(void)
+{
+    return s_pad ? SDL_GetGamepadJoystick(s_pad) : s_raw_joy;
+}
+int present_rumble_supported(void)
+{
+    SDL_Joystick *j = rumble_joystick();
+    return j && (!s_rumble_failed || SDL_GetTicks()>=s_rumble_retry) && SDL_JoystickConnected(j)
+        && SDL_GetBooleanProperty(SDL_GetJoystickProperties(j),
+                                  SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN, false);
+}
+static void rumble_failure(void)
+{
+    s_rumble_failed=1;s_rumble_ready=0;s_rumble_retry=SDL_GetTicks()+1000;
+}
+static int rumble_prepare(void)
+{
+    if(!present_rumble_supported())return 0;
+    if(s_rumble_ready)return 1;
+    /* Initialize silently before the first gameplay effect, through the same
+     * path as the test button. Never require an audible/vibrating test pulse. */
+    if(!SDL_RumbleJoystick(rumble_joystick(),0,0,0)){rumble_failure();return 0;}
+    s_rumble_ready=1;s_rumble_failed=0;return 1;
+}
+static void rumble_stop(void)
+{
+    SDL_Joystick *j = rumble_joystick();
+    if (j && s_rumble_running) SDL_RumbleJoystick(j, 0, 0, 0);
+    s_rumble_running = 0; s_rumble_next = 0; s_rumble_preview = 0;
+    rumble_envelope_clear(&s_rumble);
+}
+void present_rumble_test(void)
+{
+    if (!g_gfx.rumble || g_gfx.rumble_strength <= 0 || !ui_visible()
+        || (s_win && !(SDL_GetWindowFlags(s_win) & SDL_WINDOW_INPUT_FOCUS))
+        || !rumble_prepare()) return;
+    rumble_stop();
+    unsigned strength = (unsigned)(g_gfx.rumble_strength > 100 ? 100 : g_gfx.rumble_strength);
+    if (SDL_RumbleJoystick(rumble_joystick(), (Uint16)(65535 * strength / 100),
+                           (Uint16)(65535 * strength / 100), 600)) {
+        s_rumble_preview = SDL_GetTicks() + 600;
+        s_rumble_running = 1;
+    } else rumble_failure();
+}
+static void rumble_update(int flying, int focused)
+{
+    Uint64 now = SDL_GetTicks();
+    int enabled = g_gfx.rumble && g_gfx.rumble_strength > 0;
+    int active = enabled && flying && focused && !ui_visible() && !plane_ui_visible();
+    unsigned damage = 0;
+    unsigned events = rumble_poll(g_ram, active, &damage);
+    if (s_rumble_preview) {
+        if (enabled && focused && ui_visible() && now < s_rumble_preview) return;
+        rumble_stop();
+    }
+    if (!active || !rumble_prepare()) { rumble_stop(); return; }
+    rumble_envelope_event(&s_rumble, events, damage, now);
+    Uint16 low, high;
+    rumble_envelope_sample(&s_rumble, now, g_gfx.rumble_strength, &low, &high);
+    if (events & RUMBLE_STALL)
+        rumble_envelope_stall(now, g_gfx.rumble_strength, rumble_buffet_level(g_ram), &low, &high);
+    if (!low && !high) {
+        if (s_rumble_running) {
+            SDL_RumbleJoystick(rumble_joystick(), 0, 0, 0);
+            s_rumble_running = 0;
+        }
+        return;
+    }
+    if (now < s_rumble_next) return;
+    /* Short hardware lease prevents stuck vibration even if rendering stalls. */
+    if (!SDL_RumbleJoystick(rumble_joystick(), low, high, 100)) {
+        rumble_stop(); rumble_failure(); return;
+    }
+    s_rumble_running = 1; s_rumble_next = now + 20;
+}
 
 static void input_devices_close(void)
 {
@@ -98,6 +182,11 @@ static void input_select_pad(SDL_JoystickID preferred)
     SDL_Joystick *raw = !next && preferred && !SDL_IsGamepad(preferred)
                         ? SDL_OpenJoystick(preferred) : NULL;
     if (next || raw || (!preferred && (!s_pad || !SDL_GamepadConnected(s_pad)))) {
+        if (next || raw || s_pad || s_raw_joy) {
+            rumble_stop(); s_rumble_failed = s_rumble_ready = 0;
+            unsigned ignored;
+            rumble_poll(g_ram, 0, &ignored);
+        }
         if (s_pad) SDL_CloseGamepad(s_pad);
         if (s_raw_joy) SDL_CloseJoystick(s_raw_joy);
         s_pad = next;
@@ -612,12 +701,9 @@ static void poll_input(int *quit)
     float tl = 0.0f, tr = 0.0f;
     u32 aux = 0;
     int lb = 0, rb = 0, lt = 0, rt = 0;
-    /* US config +0x151 is the engine's menu/flight state (getter 08826fb0,
-     * setter 088216f8): 1 is active flight, 0 is the pause menu. The player
-     * and mission flags remain alive/unchanged while paused. */
     int phase = g_ram ? mem_r8(g_ram, 0x08a82e08u) : 0;
     int mission = g_ram && qol_player_active(g_ram) && (phase == 12 || phase == 22);
-    int flying = mission && mem_r8(g_ram, 0x08a80af4u + 0x151u) == 1;
+    int flying = acx_flight_active(g_ram);
     int focused;
     int entered_menu;
     float keyboard[IA_COUNT] = {0}, controller[IA_COUNT] = {0}, mouse[IA_COUNT] = {0};
@@ -653,12 +739,14 @@ static void poll_input(int *quit)
             break;
         case SDL_EVENT_GAMEPAD_REMOVED:
             if (s_pad && SDL_GetGamepadID(s_pad) == ev.gdevice.which) {
+                rumble_stop(); s_rumble_failed = s_rumble_ready = 0;
                 SDL_CloseGamepad(s_pad);
                 s_pad = NULL;
             }
             break;
         case SDL_EVENT_JOYSTICK_REMOVED:
             if (s_raw_joy && SDL_GetJoystickID(s_raw_joy) == ev.jdevice.which) {
+                rumble_stop(); s_rumble_failed = s_rumble_ready = 0;
                 SDL_CloseJoystick(s_raw_joy); s_raw_joy = NULL;
             }
             break;
@@ -684,6 +772,7 @@ static void poll_input(int *quit)
 #ifdef PSPRECO_INPUT_TEST
     if (s_test_focus >= 0) focused = s_test_focus;
 #endif
+    rumble_update(flying && !*quit, focused && !*quit);
 
     if (s_win) {
         bool capture = flying && focused && g_gfx.mouse_flight && !ui_visible() && !plane_ui_visible();
@@ -1331,6 +1420,7 @@ int present_gpu_init(void)
 
 void present_shutdown(void)
 {
+    rumble_stop();
     void gegpu_shutdown(void);
     if (!s_dev) return;
     gegpu_shutdown();
@@ -1391,6 +1481,7 @@ void present_test_mouse(float dx, float dy, float dt)
 }
 void present_test_input_shutdown(void)
 {
+    rumble_stop();
     input_devices_close();
     if (s_pad) SDL_CloseGamepad(s_pad);
     if (s_raw_joy) SDL_CloseJoystick(s_raw_joy);

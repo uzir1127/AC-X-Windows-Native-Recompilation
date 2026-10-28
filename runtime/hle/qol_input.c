@@ -211,6 +211,7 @@ static void camera_after(u8 *ram, u32 entity)
 }
 
 static RecompFn s_orig_cam, s_orig_yaw_l, s_orig_yaw_r;
+static RecompFn s_orig_rudder_l, s_orig_rudder_r;
 
 #define CAMERA_MSG_UPDATE 1u
 
@@ -227,6 +228,28 @@ static void ov_camera(CpuCtx *c, u8 *ram)
 static void ov_yaw_l(CpuCtx *c, u8 *ram) { yaw_common(c, ram, s_orig_yaw_l); }
 static void ov_yaw_r(CpuCtx *c, u8 *ram) { yaw_common(c, ram, s_orig_yaw_r); }
 
+static void rudder_common(CpuCtx *c, u8 *ram, RecompFn orig, int direction)
+{
+    u32 held = c->r[R_A2];
+    float magnitude = c->f[12];
+    float rudder = present_rudder();
+    /* Let the original D-pad handler drive its control-surface animation
+     * as well as the normalized axis. The integrator-only injection cannot
+     * animate the rudder. Native held input keeps its existing precedence. */
+    if (!held && qol_modern_controls_active() && qol_player_active(ram)
+        && c->r[R_A0] == mem_r32(ram, G_PLAYER_PTR)
+        && (present_aux() & (PRESENT_AUX_LB | PRESENT_AUX_RB))
+        && rudder * direction > 0.0f) {
+        c->r[R_A2] = 1;
+        c->f[12] = fabsf(rudder);
+    }
+    if (orig) orig(c, ram);
+    c->r[R_A2] = held;
+    c->f[12] = magnitude;
+}
+static void ov_rudder_l(CpuCtx *c, u8 *ram) { rudder_common(c, ram, s_orig_rudder_l, 1); }
+static void ov_rudder_r(CpuCtx *c, u8 *ram) { rudder_common(c, ram, s_orig_rudder_r, -1); }
+
 RecompFn qol_override(u32 addr, RecompFn orig)
 {
     RecompFn ov;
@@ -234,6 +257,8 @@ RecompFn qol_override(u32 addr, RecompFn orig)
     case G_CAMERA_MSG: s_orig_cam   = orig; ov = ov_camera; break;
     case G_YAW_L:      s_orig_yaw_l = orig; ov = ov_yaw_l;  break;
     case G_YAW_R:      s_orig_yaw_r = orig; ov = ov_yaw_r;  break;
+    case 0x0887d8e8u:  s_orig_rudder_l = orig; ov = ov_rudder_l; break;
+    case 0x0887da18u:  s_orig_rudder_r = orig; ov = ov_rudder_r; break;
     default:           return NULL;
     }
     qol_input_init();

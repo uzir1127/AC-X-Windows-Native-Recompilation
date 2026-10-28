@@ -60,3 +60,8 @@ See **VALIDATION.txt** in the Windows ZIP for the measured scope and earlier che
 Read [CREDITS.md](CREDITS.md) and [NOTICE.md](NOTICE.md) for source, artwork, reference and library attribution. Runtime licensing is in [LICENSE](LICENSE); each third-party component retains its own license. This is not affiliated with or endorsed by Bandai Namco or the original creators.
 
 The Windows ZIP includes matching source at **licenses/source.zip**. A separate matching-source asset is also provided on the release page. It contains the generated C needed for that release's build; game-derived generated output remains ignored in the maintained repository. Developer instructions are in **SOURCE-BUILD.txt** inside the source asset and [README.txt](README.txt). Development requires Python/compiler/SDL/Vulkan development files; playing the Windows release does not.
+
+## Rain and controller vibration
+
+- Added controller vibration for gunfire, missile/special launches, damage and low-speed flight. Feedback starts automatically during gameplay. Low-speed buffet begins at 700 km/h and increases toward 350 km/h. Change **Controller vibration**, **Vibration strength** and **Test vibration** under **F4 → Input**.
+- Improved rain with finer, softer tapered streaks and subtle moving droplets/trails on the cockpit windshield. The effect follows the game's existing rain. Toggle both additions under **F4 → Renderer → Rain clarity and cockpit water**.

@@ -11,6 +11,7 @@
 #include "../hle/timectl.h"
 #include "../hle/framerate.h"
 #include "../hle/qol_input.h"
+#include "../hle/rumble.h"
 #include "../gpu/ge.h"
 #include "present.h"
 #include "settings.h"
@@ -372,6 +373,7 @@ int main(int argc, char **argv)
     table_init();
     framerate_init(g_ram);
     qol_input_install(g_ram);
+    rumble_install(g_ram);
     timectl_init();
     sysmem_set_partition_begin(ACEPSP_LOAD_BASE + (u32)sz);
     memset(&ctx, 0, sizeof ctx);

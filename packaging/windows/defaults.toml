@@ -12,11 +12,14 @@ show_fps = false
 res_scale = 2
 anisotropy = 8
 movie_clarity = true
+rain_clarity = true
 [input]
 modern_controls = true
 modern_keyboard = true
 mouse_flight = true
 mouse_sensitivity = 100
 deadzone = 24
+rumble = true
+rumble_strength = 70
 rstick_cam = true
 r3_view = true

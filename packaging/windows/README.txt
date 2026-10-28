@@ -3,13 +3,14 @@ ACE COMBAT X - RECOMPILATION
 
 PLAY
 1. Extract this entire ZIP to a folder.
-2. Put your original US Ace Combat X ISO (ULUS10176) beside Play.bat.
+2. Put your own US Ace Combat X ISO (ULUS10176) inside the main
+   "Ace Combat X - Recompilation" folder.
 3. Open Play.bat. Press F4 for settings.
 Press F5 to show/hide FPS, frame time, detected CPU/GPU names and utilization.
 During a mission, pause with Menu before opening F4.
 
-The ISO may have any filename. Keep one ISO beside Play.bat, or drag the
-chosen ISO onto Play.bat. No installer, Python, compiler, extraction tools,
+The ISO may have any filename. Keep one ISO inside the main folder, or drag
+the chosen ISO onto Play.bat. No installer, Python, compiler, extraction tools,
 or separate image.bin are needed to play. CSO/PBP and other regions are not
 supported. The ISO is opened read-only.
 
@@ -24,7 +25,16 @@ FEATURES
   Movies keep their original detail and cadence; no movie files are bundled.
 - Zero-style keyboard/mouse, Xbox/PlayStation/Switch controls and right-stick camera.
 - F4 flight bindings for keyboards, mice, gamepads and SDL joysticks/HOTAS.
+- Controller vibration for actual gun shots, missile/special launches and damage.
 - F4 settings saved on menu close or game exit; Save now confirms the result.
+- Rain clarity replaces the native rain tile with finer tapered streaks;
+  cockpit view adds subtle sliding water droplets and trails while raining.
+
+F4 > Renderer > Rain clarity and cockpit water toggles the weather enhancement.
+It follows the original game's rain animation wherever that rain texture is
+used. Glass droplets appear only in cockpit view during rain; external views,
+dry weather, menus and movies do not receive the glass overlay. This is a
+lightweight visual treatment, without simulated water refraction.
 
 CONTROLS
 Xbox / standard SDL gamepad defaults:
@@ -35,6 +45,23 @@ A: gun   B: missile / special    X: switch weapon   Y: change target
 R3: change view
 Weapon controls keep the game's original mapping. F4 > Input changes the
 modern shoulder layout, camera sensitivity, and camera inversion.
+
+Vibration is enabled at 70% by default. F4 > Input has Controller vibration,
+Vibration strength (0-100%) and Test vibration. At 100% the 600 ms test uses
+full power on both motors. Weapon/impact pulses hold their initial strength
+before fading so the motors have time to respond.
+Gun fire produces short pulses, launches a heavier kick, and damage a stronger
+impact. These are new console-style effects, not copied PS2 game rumble data.
+Low-speed buffet starts at 80% at 700 km/h and rises smoothly to 100% at
+350 km/h or below, rather than waiting for a mechanical stall. It stops above
+700 km/h. The F4 strength slider scales the effect. Controller feedback
+initializes automatically and retries transient output failures once per
+second during flight; no manual test pulse is required by the gameplay path.
+Only the selected device vibrates. Gameplay vibration stops while paused,
+in F4/F6, or when the game loses focus. Effects expire in real time at both
+30 and 60 FPS. Support depends on the controller, connection and SDL driver;
+unsupported devices continue to work normally without vibration. This does
+not implement force-feedback steering or adaptive trigger resistance.
 
 The same physical layout applies to PlayStation and Nintendo controllers:
 L1/R1 or L/R yaw; L2/R2 or ZL/ZR brake/accelerate.

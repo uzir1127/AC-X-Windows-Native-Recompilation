@@ -4,6 +4,12 @@
 #include "present.h"
 #include "input_bindings.h"
 #include "../gpu/tex_replace.h"
+#include "../gpu/ge.h"
+#include "pspreco.h"
+#include "../hle/game_state.h"
+#include <math.h>
+
+extern "C" u8 *g_ram;
 
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
@@ -382,6 +388,8 @@ static void tab_render(void)
         ImGui::SetTooltip("Supersamples the GE render targets: %dx%d instead of "
                           "480x272. Costs GPU fill rate, nothing else.",
                           480 * g_gfx.res_scale, 272 * g_gfx.res_scale);
+    check("Rain clarity and cockpit water", &g_gfx.rain_clarity,
+          "Finer tapered rain streaks and subtle wind-driven water on cockpit glass. Active only when the game draws rain.");
     check("Cinematic clarity", &g_gfx.movie_clarity,
           "Smooth 2x cubic upscale for prerecorded movies from your ISO. "
           "Keeps the original movie cadence; live game text uses the HD font pack.");
@@ -493,6 +501,14 @@ static void tab_input(void)
         ImGui::EndCombo();
     }
     ImGui::TextWrapped("Controller: %s", present_controller_name());
+    check("Controller vibration", &g_gfx.rumble,
+          "Gun pulses, missile/special launches, damage impacts and low-speed buffet (700 km/h: 80%, 350 km/h: 100%). Stops in menus and on focus loss. 100% uses full motor output.");
+    if (ImGui::SliderInt("Vibration strength", &g_gfx.rumble_strength, 0, 100, "%d%%")) gfx_settings_touch();
+    const bool has_rumble = present_rumble_supported() != 0;
+    ImGui::BeginDisabled(!has_rumble || !g_gfx.rumble || g_gfx.rumble_strength == 0);
+    if (ImGui::Button("Test vibration")) present_rumble_test();
+    ImGui::EndDisabled();
+    if (!has_rumble) ImGui::TextDisabled("Vibration unavailable on the selected device/connection.");
     ImGui::TextDisabled("Xbox / PlayStation / Switch / mapped USB pads\n"
                         "Left stick flies; right stick looks.\n"
                         "Menu/Options/+ pauses; View/Create/- changes radar.");
@@ -660,6 +676,48 @@ static void draw_menu(void)
     ImGui::End();
 }
 
+static void draw_cockpit_water(void)
+{
+    if(!g_gfx.rain_clarity || !g_ram || !ge_weather_rain_active()
+        || s_visible || plane_ui_visible() || !acx_flight_active(g_ram)
+        || mem_r8(g_ram,0x08a80c36u)!=1) return;
+    ImVec2 size=ImGui::GetIO().DisplaySize;
+    float w=size.x,h=size.y,x0=0,y0=0;
+    if(w<=0 || h<=0) return;
+    if(g_gfx.aspect_mode==ASPECT_INTEGER) {
+        float integer=floorf(fminf(w/480.0f,h/272.0f));if(integer<1)integer=1;
+        w=480*integer;h=272*integer;x0=(size.x-w)*0.5f;y0=(size.y-h)*0.5f;
+    } else if(g_gfx.aspect_mode!=ASPECT_STRETCH) {
+        float ratio=g_gfx.aspect_mode==ASPECT_4_3 ? 4.0f/3.0f : 480.0f/272.0f;
+        if(w/h>ratio){w=h*ratio;x0=(size.x-w)*0.5f;}else{h=w/ratio;y0=(size.y-h)*0.5f;}
+    }
+    ImDrawList *d=ImGui::GetBackgroundDrawList();
+    d->PushClipRect(ImVec2(x0,y0),ImVec2(x0+w,y0+h),true);
+    float time=(float)(SDL_GetTicks()%600000u)*0.001f;
+    float scale=w/960.0f;
+    for(unsigned i=0;i<20;i++) {
+        unsigned seed=(i+1u)*2654435761u;
+        float cycle=3.0f+(float)(seed%400u)*0.01f;
+        float p=fmodf(time/cycle+(float)((seed>>12)%1000u)*0.001f,1.0f);
+        float fade=fminf(1.0f,fminf(p*8.0f,(1.0f-p)*6.0f));
+        /* Confine the overlay to the common forward windshield area, away
+         * from opaque side panels, the central reticle and HUD scales. */
+        float u=0.38f+(float)((seed>>4)%240u)*0.001f;
+        float v=0.29f+(float)((seed>>20)%320u)*0.001f-p*0.025f;
+        float cx=u-0.5f,cy=v-0.5f;if(cx*cx+cy*cy<0.0045f)continue;
+        float x=x0+(u+(u-0.5f)*p*0.015f)*w,y=y0+v*h;
+        float radius=(1.1f+(float)(seed%120u)*0.01f)*scale;
+        float trail=(8.0f+(float)((seed>>9)%16u))*scale;
+        float tx=(u-0.5f)*trail*0.5f;
+        d->AddLine(ImVec2(x-tx,y+trail),ImVec2(x,y),IM_COL32(12,22,28,(int)(21*fade)),2.3f*scale);
+        d->AddLine(ImVec2(x-tx+scale,y+trail),ImVec2(x+scale,y),IM_COL32(215,231,235,(int)(23*fade)),0.75f*scale);
+        d->AddCircleFilled(ImVec2(x,y),radius,IM_COL32(15,26,32,(int)(35*fade)),12);
+        d->AddCircle(ImVec2(x,y),radius,IM_COL32(200,222,229,(int)(39*fade)),12,0.7f*scale);
+        d->AddCircleFilled(ImVec2(x-radius*0.3f,y-radius*0.4f),radius*0.3f,IM_COL32(232,242,245,(int)(50*fade)),8);
+    }
+    d->PopClipRect();
+}
+
 static void draw_readout(void)
 {
     if (!g_gfx.show_fps) return;
@@ -715,6 +773,7 @@ void ui_new_frame(void)
     else ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
+    draw_cockpit_water();
     if (s_visible) draw_menu();
     plane_ui_draw();
     draw_readout();

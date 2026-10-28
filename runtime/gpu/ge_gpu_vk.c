@@ -7,6 +7,7 @@
 #include "../host/present.h"
 #include "../host/settings.h"
 #include "../host/video_clarity.h"
+#include "../host/rain_clarity.h"
 
 extern u8 *g_ram;
 #define SR_HOST(a) (g_ram + ((a) & PSP_ADDR_MASK))
@@ -73,6 +74,7 @@ typedef struct {
     int pending;
     uint64_t lru;
     int linear, clamp_u, clamp_v;
+    int weather_rain;
     float half_u, half_v;
     uint64_t bytes;
 } TexEnt;
@@ -1197,6 +1199,8 @@ static void tex_cache_flush(void) {
 
 static float s_tex_half[2];
 static uint32_t s_video_scaled[1024*1024], s_video_tmp[1024*512];
+static uint32_t s_rain_tile[256*256];
+static int s_rain_ready;
 
 static int movie_texture(int *w, int *h) {
     if (!g_gfx.movie_clarity || s_ge->tex_swizzle) return 0;
@@ -1210,7 +1214,7 @@ static int tex_fill(TexEnt *e, int pw, int ph, int linear, int clamp_u, int clam
     TexLevel lv[TEXREP_MAX_LEVELS];
     int nlv = 1, have = 0, ident = 0, filt = linear;
     uint32_t levels;
-    int movie_w=0, movie_h=0;
+    int movie_w=0, movie_h=0, rain=0, weather=0;
     int movie=movie_texture(&movie_w,&movie_h) && movie_w<=pw && movie_h<=ph;
 
     memset(&rep, 0, sizeof rep);
@@ -1244,6 +1248,14 @@ static int tex_fill(TexEnt *e, int pw, int ph, int linear, int clamp_u, int clam
                         movie_w,movie_h,movie_w*2,movie_h*2,pw*2,ph*2);
             }
         }
+        weather=!movie && pw==64 && ph==64 && s_ge->tex_fmt==4
+            && rain_source_matches(s_texscratch,pw,ph);
+        if (weather && g_gfx.rain_clarity) {
+            if(!s_rain_ready) {rain_make_streaks(s_texscratch,s_rain_tile);s_rain_ready=1;}
+            lv[0].px=s_rain_tile;lv[0].w=256;lv[0].h=256;filt=1;rain=1;
+            static int logged;
+            if(!logged) {logged=1;fprintf(stderr,"[weather] native rain tile matched; tapered 256x256 streaks enabled\n");}
+        }
     }
 
     if (!filt || !g_gfx.mipmaps_on) nlv = 1;
@@ -1261,14 +1273,17 @@ static int tex_fill(TexEnt *e, int pw, int ph, int linear, int clamp_u, int clam
     if (!e->img) ok = tex_make(e, lv, nlv, levels, filt, clamp_u, clamp_v);
     else         ok = tex_upload(e->img, lv, nlv, levels);
 
-    e->half_u = have ? 0.5f * (float)pw / (float)lv[0].w - 0.5f : 0.0f;
-    e->half_v = have ? 0.5f * (float)ph / (float)lv[0].h - 0.5f : 0.0f;
+    e->half_u = (have || rain) ? 0.5f * (float)pw / (float)lv[0].w - 0.5f : 0.0f;
+    e->half_v = (have || rain) ? 0.5f * (float)ph / (float)lv[0].h - 0.5f : 0.0f;
+    e->weather_rain=weather;
 
     if (have) { texrep_release(&rep); if (ok) s_cnt_repl++; }
     return ok;
 }
 
 static VkDescriptorSet tex_bind(TexEnt *e) {
+    if(e->weather_rain && s_ge->blend_enable && (s_ge->blend_mode&255u)==0xaau)
+        ge_weather_rain_seen();
     s_tex_half[0] = e->half_u;
     s_tex_half[1] = e->half_v;
     return e->set;
